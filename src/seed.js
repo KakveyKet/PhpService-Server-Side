@@ -47,7 +47,7 @@ async function seed() {
     await Role.findOneAndUpdate(
       { name: definition.name },
       { $set: { ...definition, isSystemRole: true, status: 'ACTIVE' } },
-      { upsert: true, new: true }
+      { upsert: true, returnDocument: 'after' }
     );
   }
 
@@ -124,7 +124,7 @@ async function seed() {
         },
         $setOnInsert: { createdBy: superAdmin._id }
       },
-      { upsert: true, new: true }
+      { upsert: true, returnDocument: 'after' }
     );
   }
 

@@ -61,7 +61,7 @@ async function getOrCreateTemplate() {
   return ContractTemplate.findOneAndUpdate(
     { templateCode: TEMPLATE_CODE },
     { $setOnInsert: defaultTemplate() },
-    { new: true, upsert: true, setDefaultsOnInsert: true }
+    { returnDocument: 'after', upsert: true, setDefaultsOnInsert: true }
   ).populate('updatedBy', 'displayName');
 }
 
@@ -98,7 +98,12 @@ export const updateContractTemplate = asyncHandler(async (req, res) => {
       },
       $setOnInsert: { templateCode: TEMPLATE_CODE }
     },
-    { new: true, upsert: true, runValidators: true, setDefaultsOnInsert: true }
+    {
+      returnDocument: 'after',
+      upsert: true,
+      runValidators: true,
+      setDefaultsOnInsert: true
+    }
   ).populate('updatedBy', 'displayName');
 
   await writeAudit({
