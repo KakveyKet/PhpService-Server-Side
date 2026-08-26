@@ -1,6 +1,9 @@
 import Customer from '../models/Customer.js';
+import Installment from '../models/Installment.js';
 import Loan from '../models/Loan.js';
 import LoanApplication from '../models/LoanApplication.js';
+import LoanTransaction from '../models/LoanTransaction.js';
+import Notification from '../models/Notification.js';
 import Repayment from '../models/Repayment.js';
 import User from '../models/User.js';
 import { getCloudinary } from '../config/cloudinary.js';
@@ -519,28 +522,30 @@ export const getCustomerSelfieWithIdUrl = asyncHandler(async (req, res) => {
 });
 
 export const deleteCustomer = asyncHandler(async (req, res) => {
-  const deletedIdentityImages = await runDatabaseWork(async (session) => {
+  const deletionResult = await runDatabaseWork(async (session) => {
     const customer = await Customer.findById(req.params.id).session(session);
     if (!customer) throw new AppError('Customer not found', 404);
 
-    const [applicationCount, loanCount, repaymentCount] = await Promise.all([
-      LoanApplication.countDocuments({ customerId: customer._id }).session(session),
-      Loan.countDocuments({ customerId: customer._id }).session(session),
-      Repayment.countDocuments({ customerId: customer._id }).session(session)
+    const [applications, loans] = await Promise.all([
+      LoanApplication.find({ customerId: customer._id })
+        .select('_id signature')
+        .session(session)
+        .lean(),
+      Loan.find({ customerId: customer._id })
+        .select('_id')
+        .session(session)
+        .lean()
     ]);
 
-    if (applicationCount || loanCount || repaymentCount) {
-      throw new AppError(
-        'This customer has financial records and cannot be deleted. Set the customer status to INACTIVE instead.',
-        409
-      );
-    }
+    const loanIds = loans.map((loan) => loan._id);
+    const applicationIds = applications.map((application) => application._id);
 
     const oldValues = customer.toObject();
-    const identityImages = [
+    const images = [
       customer.frontIdCard,
       customer.backIdCard,
-      customer.selfieWithId
+      customer.selfieWithId,
+      ...applications.map((application) => application.signature)
     ]
       .filter((image) => image?.publicId)
       .map((image) => ({
@@ -548,25 +553,88 @@ export const deleteCustomer = asyncHandler(async (req, res) => {
         deliveryType: image.deliveryType || 'authenticated'
       }));
 
+    const uniqueImages = Array.from(
+      new Map(images.map((image) => [image.publicId, image])).values()
+    );
+
+    const [installments, transactions, repayments, notifications] =
+      await Promise.all([
+        Installment.deleteMany(
+          { loanId: { $in: loanIds } },
+          sessionOptions(session)
+        ),
+        LoanTransaction.deleteMany(
+          { loanId: { $in: loanIds } },
+          sessionOptions(session)
+        ),
+        Repayment.deleteMany(
+          {
+            $or: [
+              { customerId: customer._id },
+              { loanId: { $in: loanIds } }
+            ]
+          },
+          sessionOptions(session)
+        ),
+        Notification.deleteMany(
+          {
+            $or: [
+              ...(customer.userId ? [{ userId: customer.userId }] : []),
+              { referenceId: { $in: [...loanIds, ...applicationIds] } }
+            ]
+          },
+          sessionOptions(session)
+        )
+      ]);
+
+    const deletedLoans = await Loan.deleteMany(
+      { customerId: customer._id },
+      sessionOptions(session)
+    );
+    const deletedApplications = await LoanApplication.deleteMany(
+      { customerId: customer._id },
+      sessionOptions(session)
+    );
+
+    let deletedUsers = 0;
     if (customer.userId) {
-      await User.deleteOne({ _id: customer.userId }, sessionOptions(session));
+      const result = await User.deleteOne(
+        { _id: customer.userId },
+        sessionOptions(session)
+      );
+      deletedUsers = result.deletedCount;
     }
 
     await Customer.deleteOne({ _id: customer._id }, sessionOptions(session));
 
+    const deletedRecords = {
+      customers: 1,
+      users: deletedUsers,
+      applications: deletedApplications.deletedCount,
+      loans: deletedLoans.deletedCount,
+      installments: installments.deletedCount,
+      repayments: repayments.deletedCount,
+      loanTransactions: transactions.deletedCount,
+      notifications: notifications.deletedCount
+    };
+
     await writeAudit({
       req,
-      action: 'CUSTOMER_DELETED',
+      action: 'CUSTOMER_FORCE_DELETED',
       entityType: 'CUSTOMER',
       entityId: customer._id,
       oldValues,
+      newValues: { deletedRecords },
       session
     });
 
-    return identityImages;
+    return {
+      images: uniqueImages,
+      deletedRecords
+    };
   });
 
-  for (const image of deletedIdentityImages) {
+  for (const image of deletionResult.images) {
     try {
       await getCloudinary().uploader.destroy(image.publicId, {
         resource_type: 'image',
@@ -583,6 +651,7 @@ export const deleteCustomer = asyncHandler(async (req, res) => {
 
   res.json({
     success: true,
-    message: 'Customer deleted successfully'
+    message: 'Customer and all related records deleted successfully',
+    deletedRecords: deletionResult.deletedRecords
   });
 });
