@@ -54,7 +54,7 @@ export const listLoans = asyncHandler(async (req, res) => {
 
   const [items, total] = await Promise.all([
     Loan.find(filter)
-      .populate('customerId', 'customerCode firstName middleName lastName phone')
+      .populate('customerId', 'customerCode name firstName middleName lastName phone')
       .populate('productId', 'productCode name')
       .sort({ createdAt: -1 })
       .skip((page - 1) * limit)
@@ -66,7 +66,7 @@ export const listLoans = asyncHandler(async (req, res) => {
 
 export const getLoan = asyncHandler(async (req, res) => {
   const loan = await Loan.findById(req.params.id)
-    .populate('customerId', 'customerCode firstName middleName lastName phone userId')
+    .populate('customerId', 'customerCode name firstName middleName lastName phone userId')
     .populate('productId', 'productCode name');
   if (!loan) throw new AppError('Loan not found', 404);
 

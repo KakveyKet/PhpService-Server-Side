@@ -4,6 +4,7 @@ import Loan from '../models/Loan.js';
 import LoanApplication from '../models/LoanApplication.js';
 import Notification from '../models/Notification.js';
 import Product from '../models/Product.js';
+import { getCloudinary } from '../config/cloudinary.js';
 import { ROLES } from '../constants/index.js';
 import { writeAudit } from '../services/auditService.js';
 import { generateLoanSchedule } from '../services/loanScheduleService.js';
@@ -12,6 +13,63 @@ import { asyncHandler } from '../utils/asyncHandler.js';
 import { nextNumber } from '../utils/counter.js';
 import { runDatabaseWork, sessionOptions } from '../utils/databaseWork.js';
 import { toDecimal, toMoney } from '../utils/decimal.js';
+
+const CUSTOMER_TERM_OPTIONS = [6, 12, 24, 36, 48];
+
+function uploadPrivateImage(buffer, options) {
+  const cloudinary = getCloudinary();
+
+  return new Promise((resolve, reject) => {
+    const uploadStream = cloudinary.uploader.upload_stream(
+      options,
+      (error, result) => {
+        if (error) reject(error);
+        else resolve(result);
+      }
+    );
+
+    uploadStream.end(buffer);
+  });
+}
+
+function imageMetadata(result, file, userId) {
+  return {
+    assetId: result.asset_id || '',
+    publicId: result.public_id,
+    version: result.version || null,
+    format: result.format,
+    resourceType: result.resource_type || 'image',
+    deliveryType: result.type || 'authenticated',
+    bytes: result.bytes || file.size || 0,
+    width: result.width || 0,
+    height: result.height || 0,
+    originalFilename: file.originalname || '',
+    uploadedBy: userId,
+    uploadedAt: new Date()
+  };
+}
+
+function privateImageUrl(image) {
+  const expiresAt = Math.floor(Date.now() / 1000) + 5 * 60;
+  const url = getCloudinary().utils.private_download_url(
+    image.publicId,
+    image.format,
+    {
+      resource_type: 'image',
+      type: image.deliveryType || 'authenticated',
+      expires_at: expiresAt,
+      attachment: false
+    }
+  );
+
+  return { url, expiresAt };
+}
+
+function requiredText(value, label) {
+  const normalized = String(value || '').trim();
+  if (!normalized) throw new AppError(`${label} is required`, 422);
+  return normalized;
+}
 
 async function customerForUser(userId) {
   const customer = await Customer.findOne({ userId });
@@ -55,7 +113,7 @@ export const listApplications = asyncHandler(async (req, res) => {
 
   const [items, total] = await Promise.all([
     LoanApplication.find(filter)
-      .populate('customerId', 'customerCode firstName middleName lastName phone')
+      .populate('customerId', 'customerCode name firstName middleName lastName phone')
       .populate({ path: 'productId', populate: { path: 'rateId' } })
       .sort({ createdAt: -1 })
       .skip((page - 1) * limit)
@@ -85,8 +143,164 @@ export const createApplication = asyncHandler(async (req, res) => {
   if (amount.lessThan(product.minimumAmount.toString()) || amount.greaterThan(product.maximumAmount.toString())) {
     throw new AppError('Requested amount is outside the product limit', 422);
   }
-  if (Number(requestedTerm) < product.minimumTerm || Number(requestedTerm) > product.maximumTerm) {
+
+  const term = Number(requestedTerm);
+  const isCustomerPortalApplication = req.role === ROLES.CUSTOMER;
+
+  if (
+    isCustomerPortalApplication &&
+    !CUSTOMER_TERM_OPTIONS.includes(term)
+  ) {
+    throw new AppError('Select a 6, 12, 24, 36 or 48 month term', 422);
+  }
+
+  if (
+    !isCustomerPortalApplication &&
+    (term < product.minimumTerm || term > product.maximumTerm)
+  ) {
     throw new AppError('Requested term is outside the product limit', 422);
+  }
+
+  let applicantSnapshot = {};
+  let termsAcceptedAt = null;
+  let termsVersion = '';
+  let signature = null;
+
+  if (isCustomerPortalApplication) {
+    if (req.body.termsAccepted !== 'true' && req.body.termsAccepted !== true) {
+      throw new AppError('Accept the Loan Service Terms & Agreement', 422);
+    }
+
+    const applicantName = requiredText(req.body.applicantName, 'Name');
+    const applicantAddress = requiredText(req.body.applicantAddress, 'Address');
+    const idCardNumber = requiredText(req.body.idCardNumber, 'ID card number');
+    const bankName = requiredText(req.body.bankName, 'Bank name');
+    const bankAccountNumber = requiredText(
+      req.body.bankAccountNumber,
+      'Bank account number'
+    );
+    const signatureFile = req.files?.signature?.[0];
+
+    if (!signatureFile) {
+      throw new AppError('Upload or draw your signature', 422);
+    }
+
+    const applicationNumber = await nextNumber('application', 'APP');
+    const identityFields = ['frontIdCard', 'backIdCard', 'selfieWithId'];
+    const identityPublicIds = {
+      frontIdCard: 'front-id-card',
+      backIdCard: 'back-id-card',
+      selfieWithId: 'selfie-with-id'
+    };
+
+    try {
+      for (const field of identityFields) {
+        const file = req.files?.[field]?.[0];
+        if (!file) continue;
+
+        const result = await uploadPrivateImage(file.buffer, {
+          folder: `microfinance/customers/${customer._id}`,
+          public_id: identityPublicIds[field],
+          resource_type: 'image',
+          type: 'authenticated',
+          overwrite: true,
+          invalidate: true,
+          transformation: [
+            { width: 2200, height: 2200, crop: 'limit', quality: 'auto' }
+          ]
+        });
+
+        customer[field] = imageMetadata(result, file, req.user._id);
+      }
+
+      const missingIdentityImage = identityFields.find(
+        (field) => !customer[field]?.publicId
+      );
+
+      if (missingIdentityImage) {
+        const labels = {
+          frontIdCard: 'front ID card image',
+          backIdCard: 'back ID card image',
+          selfieWithId: 'selfie with ID card'
+        };
+        throw new AppError(`Upload the ${labels[missingIdentityImage]}`, 422);
+      }
+
+      const signatureResult = await uploadPrivateImage(signatureFile.buffer, {
+        folder: `microfinance/applications/${applicationNumber}`,
+        public_id: 'signature',
+        resource_type: 'image',
+        type: 'authenticated',
+        overwrite: true,
+        invalidate: true,
+        transformation: [
+          { width: 1600, height: 600, crop: 'limit', quality: 'auto' }
+        ]
+      });
+
+      signature = imageMetadata(signatureResult, signatureFile, req.user._id);
+    } catch (error) {
+      if (error instanceof AppError) throw error;
+      throw new AppError(
+        error?.message || 'Cloudinary could not upload the application images',
+        502
+      );
+    }
+
+    customer.name = applicantName;
+    customer.nationalId = idCardNumber;
+    customer.bankName = bankName;
+    customer.bankNumber = bankAccountNumber;
+    customer.identityVerificationStatus = 'PENDING';
+    customer.identityVerifiedBy = null;
+    customer.identityVerifiedAt = null;
+    await customer.save();
+
+    applicantSnapshot = {
+      name: applicantName,
+      address: applicantAddress,
+      idCardNumber,
+      bankName,
+      bankAccountNumber
+    };
+    termsAcceptedAt = new Date();
+    termsVersion = 'LOAN_SERVICE_TERMS_V1';
+
+    const application = await LoanApplication.create({
+      applicationNumber,
+      customerId: customer._id,
+      productId: product._id,
+      requestedAmount: toMoney(amount),
+      requestedTerm: term,
+      purpose,
+      applicantSnapshot,
+      termsAcceptedAt,
+      termsVersion,
+      signature,
+      monthlyIncome: toMoney(req.body.monthlyIncome ?? customer.monthlyIncome ?? 0),
+      monthlyExpense: toMoney(req.body.monthlyExpense || 0),
+      collateralDescription: req.body.collateralDescription || '',
+      status: 'SUBMITTED',
+      createdBy: req.user._id
+    });
+
+    await writeAudit({
+      req,
+      action: 'LOAN_APPLICATION_CREATED',
+      entityType: 'LOAN_APPLICATION',
+      entityId: application._id,
+      newValues: {
+        applicationNumber,
+        requestedAmount,
+        requestedTerm: term,
+        termsAcceptedAt,
+        identityImagesSubmitted: true,
+        signatureSubmitted: true
+      }
+    });
+
+    res.status(201).json({ success: true, item: application });
+    return;
   }
 
   const application = await LoanApplication.create({
@@ -94,7 +308,7 @@ export const createApplication = asyncHandler(async (req, res) => {
     customerId: customer._id,
     productId: product._id,
     requestedAmount: toMoney(amount),
-    requestedTerm: Number(requestedTerm),
+    requestedTerm: term,
     purpose,
     monthlyIncome: toMoney(req.body.monthlyIncome ?? customer.monthlyIncome ?? 0),
     monthlyExpense: toMoney(req.body.monthlyExpense || 0),
@@ -105,6 +319,37 @@ export const createApplication = asyncHandler(async (req, res) => {
 
   await writeAudit({ req, action: 'LOAN_APPLICATION_CREATED', entityType: 'LOAN_APPLICATION', entityId: application._id, newValues: req.body });
   res.status(201).json({ success: true, item: application });
+});
+
+export const getApplicationSignatureUrl = asyncHandler(async (req, res) => {
+  const application = await LoanApplication.findById(req.params.id).select(
+    'customerId signature'
+  );
+
+  if (!application) throw new AppError('Loan application not found', 404);
+
+  if (req.role === ROLES.CUSTOMER) {
+    const ownsApplication = await Customer.exists({
+      _id: application.customerId,
+      userId: req.user._id
+    });
+
+    if (!ownsApplication) {
+      throw new AppError('You cannot view this application signature', 403);
+    }
+  }
+
+  if (!application.signature?.publicId) {
+    throw new AppError('This application does not have a signature', 404);
+  }
+
+  const signed = privateImageUrl(application.signature);
+
+  res.json({
+    success: true,
+    url: signed.url,
+    expiresAt: new Date(signed.expiresAt * 1000).toISOString()
+  });
 });
 
 export const reviewApplication = asyncHandler(async (req, res) => {
@@ -149,7 +394,22 @@ export const reviewApplication = asyncHandler(async (req, res) => {
       if (amount.lessThan(product.minimumAmount.toString()) || amount.greaterThan(product.maximumAmount.toString())) {
         throw new AppError('Approved amount is outside the product limit', 422);
       }
-      if (approvedTerm < product.minimumTerm || approvedTerm > product.maximumTerm) {
+      const customerPortalApplication = Boolean(application.termsAcceptedAt);
+
+      if (
+        customerPortalApplication &&
+        !CUSTOMER_TERM_OPTIONS.includes(approvedTerm)
+      ) {
+        throw new AppError(
+          'Approved term must be 6, 12, 24, 36 or 48 months',
+          422
+        );
+      }
+
+      if (
+        !customerPortalApplication &&
+        (approvedTerm < product.minimumTerm || approvedTerm > product.maximumTerm)
+      ) {
         throw new AppError('Approved term is outside the product limit', 422);
       }
 

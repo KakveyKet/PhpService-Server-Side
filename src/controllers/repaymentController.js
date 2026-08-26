@@ -97,7 +97,7 @@ export const listRepayments = asyncHandler(async (req, res) => {
 
   const [items, total] = await Promise.all([
     Repayment.find(filter)
-      .populate('customerId', 'customerCode firstName middleName lastName')
+      .populate('customerId', 'customerCode name firstName middleName lastName')
       .populate('loanId', 'loanNumber productSnapshot')
       .populate('receivedBy', 'displayName')
       .sort({ paymentDate: -1 })

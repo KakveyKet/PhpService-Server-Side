@@ -1,6 +1,7 @@
 import ContractTemplate from '../models/ContractTemplate.js';
 import Installment from '../models/Installment.js';
 import Loan from '../models/Loan.js';
+import { getCloudinary } from '../config/cloudinary.js';
 import { writeAudit } from '../services/auditService.js';
 import { AppError } from '../utils/AppError.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
@@ -65,6 +66,27 @@ async function getOrCreateTemplate() {
   ).populate('updatedBy', 'displayName');
 }
 
+function borrowerSignatureUrl(signature) {
+  if (!signature?.publicId || !signature?.format) return null;
+
+  const expiresAt = Math.floor(Date.now() / 1000) + 5 * 60;
+  const url = getCloudinary().utils.private_download_url(
+    signature.publicId,
+    signature.format,
+    {
+      resource_type: 'image',
+      type: signature.deliveryType || 'authenticated',
+      expires_at: expiresAt,
+      attachment: false
+    }
+  );
+
+  return {
+    url,
+    expiresAt: new Date(expiresAt * 1000).toISOString()
+  };
+}
+
 export const getContractTemplate = asyncHandler(async (_req, res) => {
   const template = await getOrCreateTemplate();
   res.json({ success: true, item: template });
@@ -124,7 +146,11 @@ export const updateContractTemplate = asyncHandler(async (req, res) => {
 export const getLoanContract = asyncHandler(async (req, res) => {
   const [loan, template] = await Promise.all([
     Loan.findById(req.params.loanId)
-      .populate('customerId', 'customerCode firstName middleName lastName nationalId phone email')
+      .populate('customerId', 'customerCode name firstName middleName lastName nationalId phone email')
+      .populate(
+        'applicationId',
+        'applicationNumber applicantSnapshot signature termsAcceptedAt'
+      )
       .populate('approvedBy', 'displayName'),
     getOrCreateTemplate()
   ]);
@@ -134,14 +160,16 @@ export const getLoanContract = asyncHandler(async (req, res) => {
   const installments = await Installment.find({ loanId: loan._id })
     .sort({ installmentNumber: 1 });
 
-  const nextInstallment = installments.find((installment) =>
-    ['PENDING', 'PARTIALLY_PAID', 'OVERDUE'].includes(installment.status)
-  ) || installments[installments.length - 1] || null;
-
   const customer = loan.customerId;
-  const borrowerName = [customer?.firstName, customer?.middleName, customer?.lastName]
-    .filter(Boolean)
-    .join(' ');
+  const application = loan.applicationId;
+  const applicationSnapshot = application?.applicantSnapshot;
+  const customerName = customer?.name ||
+    [customer?.firstName, customer?.middleName, customer?.lastName]
+      .filter(Boolean)
+      .join(' ');
+  const borrowerName = applicationSnapshot?.name || customerName;
+  const firstInstallment = installments[0] || null;
+  const signature = borrowerSignatureUrl(application?.signature);
 
   res.json({
     success: true,
@@ -150,16 +178,24 @@ export const getLoanContract = asyncHandler(async (req, res) => {
       borrower: {
         name: borrowerName || '—',
         customerCode: customer?.customerCode || '—',
-        idNumber: customer?.nationalId || '—',
+        idNumber: applicationSnapshot?.idCardNumber || customer?.nationalId || '—',
         mobileNumber: customer?.phone || '—',
-        email: customer?.email || '—'
+        email: customer?.email || '—',
+        address: applicationSnapshot?.address || '—',
+        bankName: applicationSnapshot?.bankName || '—',
+        bankAccountNumber: applicationSnapshot?.bankAccountNumber || '—',
+        signatureUrl: signature?.url || null,
+        signatureUrlExpiresAt: signature?.expiresAt || null,
+        termsAcceptedAt: application?.termsAcceptedAt || null
       },
       loan: {
         id: loan._id,
         loanNumber: loan.loanNumber,
         productName: loan.productSnapshot?.name || '—',
         principalAmount: loan.principalAmount,
-        installmentPayment: nextInstallment?.totalDue || 0,
+        amountPerInstallment: firstInstallment?.totalDue || 0,
+        installmentPayment: firstInstallment?.totalDue || 0,
+        totalAmount: loan.totalPayable,
         term: loan.term,
         termUnit: loan.termUnit,
         creditTerm: `${loan.term} ${loan.termUnit.toLowerCase()}${loan.term === 1 ? '' : 's'}`,

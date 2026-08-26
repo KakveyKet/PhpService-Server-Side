@@ -60,7 +60,7 @@ export const getDashboard = asyncHandler(async (req, res) => {
       { $group: { _id: null, value: { $sum: '$amount' } } }
     ]),
     LoanApplication.find()
-      .populate('customerId', 'customerCode firstName lastName')
+      .populate('customerId', 'customerCode name firstName lastName')
       .populate('productId', 'name')
       .sort({ createdAt: -1 })
       .limit(5)

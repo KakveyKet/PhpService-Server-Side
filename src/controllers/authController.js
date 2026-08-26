@@ -1,24 +1,19 @@
-import jwt from "jsonwebtoken";
-import Customer from "../models/Customer.js";
-import Role from "../models/Role.js";
-import User from "../models/User.js";
-import { ROLES } from "../constants/index.js";
-import { AppError } from "../utils/AppError.js";
-import { asyncHandler } from "../utils/asyncHandler.js";
-import { nextNumber } from "../utils/counter.js";
-import { runDatabaseWork, sessionOptions } from "../utils/databaseWork.js";
-import { toMoney } from "../utils/decimal.js";
+import jwt from 'jsonwebtoken';
+import Customer from '../models/Customer.js';
+import Role from '../models/Role.js';
+import User from '../models/User.js';
+import { ROLES } from '../constants/index.js';
+import { AppError } from '../utils/AppError.js';
+import { asyncHandler } from '../utils/asyncHandler.js';
+import { nextNumber } from '../utils/counter.js';
+import { runDatabaseWork, sessionOptions } from '../utils/databaseWork.js';
+import { isValidPhone, normalizePhone } from '../utils/phone.js';
 
 function createToken(user) {
   return jwt.sign(
-    {
-      sub: user._id.toString(),
-      role: user.roleId.name,
-    },
+    { sub: user._id.toString(), role: user.roleId.name },
     process.env.JWT_SECRET,
-    {
-      expiresIn: process.env.JWT_EXPIRES_IN || "1d",
-    },
+    { expiresIn: process.env.JWT_EXPIRES_IN || '1d' }
   );
 }
 
@@ -32,20 +27,16 @@ function userPayload(user) {
     profileImage: user.profileImage,
     status: user.status,
     role: user.roleId.name,
-    roleDisplayName: user.roleId.displayName,
+    roleDisplayName: user.roleId.displayName
   };
 
-  /*
-   * Security activity and permissions
-   * are returned only for SUPER_ADMIN.
-   */
   if (user.roleId.name === ROLES.SUPER_ADMIN) {
     Object.assign(payload, {
       permissions: user.roleId.permissions || [],
       lastLoginAt: user.lastLoginAt,
       passwordChangedAt: user.passwordChangedAt,
       createdAt: user.createdAt,
-      updatedAt: user.updatedAt,
+      updatedAt: user.updatedAt
     });
   }
 
@@ -54,128 +45,99 @@ function userPayload(user) {
 
 export const login = asyncHandler(async (req, res) => {
   const { login: loginValue, password } = req.body;
-
-  if (!loginValue || !password) {
-    throw new AppError("Login and password are required", 422);
-  }
+  if (!loginValue || !password) throw new AppError('Login and password are required', 422);
 
   const normalized = String(loginValue).trim().toLowerCase();
-
+  const normalizedPhone = normalizePhone(loginValue);
   const user = await User.findOne({
     $or: [
-      {
-        username: normalized,
-      },
-      {
-        email: normalized,
-      },
-    ],
+      { username: normalized },
+      { email: normalized },
+      { phone: normalizedPhone }
+    ]
   })
-    .select("+passwordHash")
-    .populate("roleId");
+    .select('+passwordHash')
+    .populate('roleId');
 
   if (!user || !(await user.comparePassword(password))) {
-    throw new AppError("Invalid login or password", 401);
+    throw new AppError('Invalid login or password', 401);
   }
-
-  if (user.status !== "ACTIVE" || user.roleId?.status !== "ACTIVE") {
-    throw new AppError("Account is unavailable", 403);
+  if (user.status !== 'ACTIVE' || user.roleId.status !== 'ACTIVE') {
+    throw new AppError('Account is unavailable', 403);
   }
 
   user.lastLoginAt = new Date();
   await user.save();
 
-  res.json({
-    success: true,
-    token: createToken(user),
-    user: userPayload(user),
-  });
+  res.json({ success: true, token: createToken(user), user: userPayload(user) });
 });
 
 export const registerCustomer = asyncHandler(async (req, res) => {
-  const {
-    username,
-    email,
-    phone,
-    password,
-    firstName,
-    middleName,
-    lastName,
-    nationalId,
-  } = req.body;
+  const { phone, password } = req.body;
+  const normalizedPhone = normalizePhone(phone);
 
-  if (!username || !phone || !password || !firstName || !lastName) {
-    throw new AppError(
-      "Username, phone, password, first name and last name are required",
-      422,
-    );
+  if (!normalizedPhone || !password) {
+    throw new AppError('Phone number and password are required', 422);
   }
 
-  if (String(password).length < 8) {
-    throw new AppError("Password must contain at least 8 characters", 422);
+  if (!isValidPhone(normalizedPhone)) {
+    throw new AppError('Enter a valid phone number', 422);
   }
 
-  const role = await Role.findOne({
-    name: ROLES.CUSTOMER,
-    status: "ACTIVE",
+  if (String(password).length < 8) throw new AppError('Password must contain at least 8 characters', 422);
+
+  const role = await Role.findOne({ name: ROLES.CUSTOMER, status: 'ACTIVE' });
+  if (!role) throw new AppError('Customer registration is not configured', 500);
+
+  const existingUser = await User.exists({
+    $or: [
+      { username: normalizedPhone.toLowerCase() },
+      { phone: normalizedPhone }
+    ]
   });
 
-  if (!role) {
-    throw new AppError("Customer registration is not configured", 500);
+  if (existingUser) {
+    throw new AppError('This phone number is already registered', 409);
   }
 
   const savedUserId = await runDatabaseWork(async (session) => {
-    const [user] = await User.create(
-      [
-        {
+      const [user] = await User.create(
+        [{
           roleId: role._id,
-          username,
-          email: email || undefined,
-          phone,
+          username: normalizedPhone,
+          phone: normalizedPhone,
           passwordHash: password,
-          displayName: `${firstName} ${lastName}`,
-        },
-      ],
-      sessionOptions(session),
-    );
+          displayName: 'Customer'
+        }],
+        sessionOptions(session)
+      );
 
-    const customerCode = await nextNumber("customer", "CUS", session);
-
-    await Customer.create(
-      [
-        {
+      const customerCode = await nextNumber('customer', 'CUS', session);
+      await Customer.create(
+        [{
           customerCode,
           userId: user._id,
-          firstName,
-          middleName: middleName || "",
-          lastName,
-          nationalId: nationalId || undefined,
-          phone,
-          email: email || "",
-          monthlyIncome: toMoney(req.body.monthlyIncome || 0),
-          occupation: req.body.occupation || "",
-          address: req.body.address || {},
-          createdBy: user._id,
-        },
-      ],
-      sessionOptions(session),
-    );
+          name: '',
+          firstName: '',
+          middleName: '',
+          lastName: '',
+          phone: normalizedPhone,
+          createdBy: user._id
+        }],
+        sessionOptions(session)
+      );
 
-    return user._id;
+      return user._id;
   });
 
-  const savedUser = await User.findById(savedUserId).populate("roleId");
-
+  const savedUser = await User.findById(savedUserId).populate('roleId');
   res.status(201).json({
     success: true,
     token: createToken(savedUser),
-    user: userPayload(savedUser),
+    user: userPayload(savedUser)
   });
 });
 
 export const me = asyncHandler(async (req, res) => {
-  res.json({
-    success: true,
-    user: userPayload(req.user),
-  });
+  res.json({ success: true, user: userPayload(req.user) });
 });

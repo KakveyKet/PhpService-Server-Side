@@ -19,6 +19,21 @@ export function errorHandler(error, _req, res, _next) {
     message = `${field} already exists`;
   }
 
+  if (error.code === 'LIMIT_FILE_SIZE') {
+    statusCode = 413;
+    message = 'Each identity image must not exceed 8 MB';
+  }
+
+  if (error.code === 'LIMIT_UNEXPECTED_FILE') {
+    statusCode = 422;
+    message = 'Use frontIdCard, backIdCard, selfieWithId or signature for image uploads';
+  }
+
+  if (error.code === 'LIMIT_FILE_COUNT') {
+    statusCode = 422;
+    message = 'A maximum of four application images can be uploaded';
+  }
+
   res.status(statusCode).json({
     success: false,
     message,

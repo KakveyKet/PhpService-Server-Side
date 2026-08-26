@@ -112,7 +112,7 @@ async function seed() {
           minimumAmount: toMoney(product.minimumAmount),
           maximumAmount: toMoney(product.maximumAmount),
           minimumTerm: 6,
-          maximumTerm: 36,
+          maximumTerm: 48,
           termUnit: 'MONTH',
           repaymentFrequency: 'MONTHLY',
           processingFeePercent: toRate(1),
