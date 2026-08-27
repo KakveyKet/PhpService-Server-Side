@@ -8,6 +8,7 @@ import { getCloudinary } from '../config/cloudinary.js';
 import { ROLES } from '../constants/index.js';
 import { writeAudit } from '../services/auditService.js';
 import { generateLoanSchedule } from '../services/loanScheduleService.js';
+import { publishChange } from '../services/realtimeService.js';
 import { AppError } from '../utils/AppError.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
 import { nextNumber } from '../utils/counter.js';
@@ -299,6 +300,14 @@ export const createApplication = asyncHandler(async (req, res) => {
       }
     });
 
+    publishChange({
+      topics: ['applications', 'dashboard', 'customers'],
+      action: 'LOAN_APPLICATION_CREATED',
+      entityId: application._id,
+      staff: true,
+      userIds: [customer.userId]
+    });
+
     res.status(201).json({ success: true, item: application });
     return;
   }
@@ -318,7 +327,118 @@ export const createApplication = asyncHandler(async (req, res) => {
   });
 
   await writeAudit({ req, action: 'LOAN_APPLICATION_CREATED', entityType: 'LOAN_APPLICATION', entityId: application._id, newValues: req.body });
+
+  publishChange({
+    topics: ['applications', 'dashboard'],
+    action: 'LOAN_APPLICATION_CREATED',
+    entityId: application._id,
+    staff: true,
+    userIds: [customer.userId]
+  });
+
   res.status(201).json({ success: true, item: application });
+});
+
+export const updateApplicationPlan = asyncHandler(async (req, res) => {
+  const { requestedAmount, requestedTerm, comment = '' } = req.body;
+
+  if (requestedAmount === undefined || requestedTerm === undefined) {
+    throw new AppError('Requested amount and term are required', 422);
+  }
+
+  let savedApplicationId;
+  let customerUserId = null;
+
+  await runDatabaseWork(async (session) => {
+    const application = await LoanApplication.findById(req.params.id).session(session);
+    if (!application) throw new AppError('Loan application not found', 404);
+
+    if (!['SUBMITTED', 'UNDER_REVIEW'].includes(application.status)) {
+      throw new AppError(
+        'Only submitted or under-review applications can change their plan',
+        409
+      );
+    }
+
+    const product = await Product.findById(application.productId).session(session);
+    if (!product) throw new AppError('Loan product not found', 404);
+
+    const amount = toDecimal(requestedAmount);
+    if (
+      amount.lessThan(product.minimumAmount.toString()) ||
+      amount.greaterThan(product.maximumAmount.toString())
+    ) {
+      throw new AppError('Requested amount is outside the product limit', 422);
+    }
+
+    const term = Number(requestedTerm);
+    if (!Number.isInteger(term) || term < 1) {
+      throw new AppError('Requested term must be a whole number', 422);
+    }
+
+    if (application.termsAcceptedAt) {
+      if (!CUSTOMER_TERM_OPTIONS.includes(term)) {
+        throw new AppError('Select a 6, 12, 24, 36 or 48 month term', 422);
+      }
+    } else if (term < product.minimumTerm || term > product.maximumTerm) {
+      throw new AppError('Requested term is outside the product limit', 422);
+    }
+
+    const oldValues = {
+      requestedAmount: application.requestedAmount,
+      requestedTerm: application.requestedTerm
+    };
+
+    application.requestedAmount = toMoney(amount);
+    application.requestedTerm = term;
+    await application.save(sessionOptions(session));
+
+    const customer = await Customer.findById(application.customerId).session(session);
+    customerUserId = customer?.userId || null;
+
+    if (customerUserId) {
+      await Notification.create(
+        [{
+          userId: customerUserId,
+          title: 'Loan application plan updated',
+          message: `${application.applicationNumber} now requests ${term} periods.`,
+          type: 'LOAN',
+          referenceId: application._id
+        }],
+        sessionOptions(session)
+      );
+    }
+
+    await writeAudit({
+      req,
+      action: 'LOAN_APPLICATION_PLAN_UPDATED',
+      entityType: 'LOAN_APPLICATION',
+      entityId: application._id,
+      oldValues,
+      newValues: {
+        requestedAmount: application.requestedAmount,
+        requestedTerm: application.requestedTerm,
+        comment: String(comment || '').trim()
+      },
+      session
+    });
+
+    savedApplicationId = application._id;
+  });
+
+  const savedApplication = await LoanApplication.findById(savedApplicationId)
+    .populate('customerId', 'customerCode name firstName middleName lastName phone')
+    .populate({ path: 'productId', populate: { path: 'rateId' } });
+
+  publishChange({
+    topics: ['applications', 'dashboard', 'notifications'],
+    action: 'LOAN_APPLICATION_PLAN_UPDATED',
+    entityId: savedApplication._id,
+    staff: true,
+    userIds: [customerUserId]
+  });
+
+  res.json({ success: true, item: savedApplication });
 });
 
 export const getApplicationSignatureUrl = asyncHandler(async (req, res) => {
@@ -490,6 +610,17 @@ export const reviewApplication = asyncHandler(async (req, res) => {
 
       await writeAudit({ req, action: 'LOAN_APPLICATION_APPROVED', entityType: 'LOAN', entityId: loan._id, newValues: req.body, session });
       responseItem = loan;
+  });
+
+  const realtimeCustomer = await Customer.findById(responseItem.customerId).select('userId');
+  publishChange({
+    topics: decision === 'APPROVED'
+      ? ['applications', 'loans', 'dashboard', 'notifications']
+      : ['applications', 'dashboard'],
+    action: `LOAN_APPLICATION_${decision}`,
+    entityId: responseItem._id,
+    staff: true,
+    userIds: [realtimeCustomer?.userId]
   });
 
   res.json({ success: true, item: responseItem });

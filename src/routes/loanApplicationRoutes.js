@@ -3,7 +3,8 @@ import {
   createApplication,
   getApplicationSignatureUrl,
   listApplications,
-  reviewApplication
+  reviewApplication,
+  updateApplicationPlan
 } from '../controllers/loanApplicationController.js';
 import { ROLES } from '../constants/index.js';
 import { allowRoles, authenticate } from '../middleware/auth.js';
@@ -22,6 +23,11 @@ router.get(
   '/:id/signature',
   allowRoles(ROLES.CUSTOMER, ROLES.ADMIN, ROLES.SUPER_ADMIN),
   getApplicationSignatureUrl
+);
+router.patch(
+  '/:id/plan',
+  allowRoles(ROLES.ADMIN, ROLES.SUPER_ADMIN),
+  updateApplicationPlan
 );
 router.post('/:id/review', allowRoles(ROLES.ADMIN, ROLES.SUPER_ADMIN), reviewApplication);
 

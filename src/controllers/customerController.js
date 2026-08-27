@@ -6,9 +6,11 @@ import LoanTransaction from '../models/LoanTransaction.js';
 import Notification from '../models/Notification.js';
 import Repayment from '../models/Repayment.js';
 import User from '../models/User.js';
+import Withdrawal from '../models/Withdrawal.js';
 import { getCloudinary } from '../config/cloudinary.js';
 import { ROLES } from '../constants/index.js';
 import { writeAudit } from '../services/auditService.js';
+import { publishChange, revokeRealtimeSession } from '../services/realtimeService.js';
 import { AppError } from '../utils/AppError.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
 import { nextNumber } from '../utils/counter.js';
@@ -213,6 +215,13 @@ export const createCustomer = asyncHandler(async (req, res) => {
     }
   });
 
+  publishChange({
+    topics: ['customers', 'dashboard'],
+    action: 'CUSTOMER_CREATED',
+    entityId: customer._id,
+    staff: true
+  });
+
   res.status(201).json({ success: true, item: customer });
 });
 
@@ -335,6 +344,14 @@ export const updateCustomer = asyncHandler(async (req, res) => {
   const updatedCustomer = await Customer.findById(updatedCustomerId).populate(
     customerPopulate
   );
+
+  publishChange({
+    topics: ['customers', 'dashboard', 'profile'],
+    action: 'CUSTOMER_UPDATED',
+    entityId: updatedCustomer._id,
+    staff: true,
+    userIds: [updatedCustomer.userId?._id || updatedCustomer.userId]
+  });
 
   res.json({ success: true, item: updatedCustomer });
 });
@@ -557,7 +574,15 @@ export const deleteCustomer = asyncHandler(async (req, res) => {
       new Map(images.map((image) => [image.publicId, image])).values()
     );
 
-    const [installments, transactions, repayments, notifications] =
+    const withdrawalsForNotifications = await Withdrawal.find({
+      customerId: customer._id
+    })
+      .select('_id')
+      .session(session)
+      .lean();
+    const withdrawalIds = withdrawalsForNotifications.map((item) => item._id);
+
+    const [installments, transactions, repayments, withdrawals, notifications] =
       await Promise.all([
         Installment.deleteMany(
           { loanId: { $in: loanIds } },
@@ -576,11 +601,19 @@ export const deleteCustomer = asyncHandler(async (req, res) => {
           },
           sessionOptions(session)
         ),
+        Withdrawal.deleteMany(
+          { customerId: customer._id },
+          sessionOptions(session)
+        ),
         Notification.deleteMany(
           {
             $or: [
               ...(customer.userId ? [{ userId: customer.userId }] : []),
-              { referenceId: { $in: [...loanIds, ...applicationIds] } }
+              {
+                referenceId: {
+                  $in: [...loanIds, ...applicationIds, ...withdrawalIds]
+                }
+              }
             ]
           },
           sessionOptions(session)
@@ -614,6 +647,7 @@ export const deleteCustomer = asyncHandler(async (req, res) => {
       loans: deletedLoans.deletedCount,
       installments: installments.deletedCount,
       repayments: repayments.deletedCount,
+      withdrawals: withdrawals.deletedCount,
       loanTransactions: transactions.deletedCount,
       notifications: notifications.deletedCount
     };
@@ -630,6 +664,7 @@ export const deleteCustomer = asyncHandler(async (req, res) => {
 
     return {
       images: uniqueImages,
+      deletedUserId: customer.userId,
       deletedRecords
     };
   });
@@ -648,6 +683,17 @@ export const deleteCustomer = asyncHandler(async (req, res) => {
       );
     }
   }
+
+  publishChange({
+    topics: ['customers', 'applications', 'loans', 'repayments', 'withdrawals', 'dashboard', 'reports'],
+    action: 'CUSTOMER_FORCE_DELETED',
+    entityId: req.params.id,
+    staff: true
+  });
+  revokeRealtimeSession(
+    deletionResult.deletedUserId,
+    'Your customer account was removed by an administrator.'
+  );
 
   res.json({
     success: true,

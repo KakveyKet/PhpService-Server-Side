@@ -1,9 +1,11 @@
 import Decimal from 'decimal.js';
+import Customer from '../models/Customer.js';
 import Installment from '../models/Installment.js';
 import Loan from '../models/Loan.js';
 import LoanTransaction from '../models/LoanTransaction.js';
 import Repayment from '../models/Repayment.js';
 import { writeAudit } from '../services/auditService.js';
+import { publishChange } from '../services/realtimeService.js';
 import { AppError } from '../utils/AppError.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
 import { nextNumber } from '../utils/counter.js';
@@ -127,6 +129,7 @@ export const createRepayment = asyncHandler(async (req, res) => {
   if (paymentAmount.lte(0)) throw new AppError('Payment amount must be greater than zero', 422);
 
   let savedRepayment;
+  let customerUserId = null;
 
   await runDatabaseWork(async (session) => {
       const loan = await Loan.findById(loanId).session(session);
@@ -212,7 +215,17 @@ export const createRepayment = asyncHandler(async (req, res) => {
       );
 
       await writeAudit({ req, action: 'REPAYMENT_CONFIRMED', entityType: 'REPAYMENT', entityId: repayment._id, newValues: req.body, session });
+      const customer = await Customer.findById(loan.customerId).select('userId').session(session);
+      customerUserId = customer?.userId || null;
       savedRepayment = repayment;
+  });
+
+  publishChange({
+    topics: ['repayments', 'loans', 'dashboard', 'reports'],
+    action: 'REPAYMENT_CONFIRMED',
+    entityId: savedRepayment._id,
+    staff: true,
+    userIds: [customerUserId]
   });
 
   res.status(201).json({ success: true, item: savedRepayment });
@@ -221,6 +234,7 @@ export const createRepayment = asyncHandler(async (req, res) => {
 export const reverseRepayment = asyncHandler(async (req, res) => {
   if (!req.body.reason) throw new AppError('Reversal reason is required', 422);
   let savedRepayment;
+  let customerUserId = null;
 
   await runDatabaseWork(async (session) => {
       const repayment = await Repayment.findById(req.params.id).session(session);
@@ -285,7 +299,17 @@ export const reverseRepayment = asyncHandler(async (req, res) => {
       );
 
       await writeAudit({ req, action: 'REPAYMENT_REVERSED', entityType: 'REPAYMENT', entityId: repayment._id, newValues: { reason: req.body.reason }, session });
+      const customer = await Customer.findById(loan.customerId).select('userId').session(session);
+      customerUserId = customer?.userId || null;
       savedRepayment = repayment;
+  });
+
+  publishChange({
+    topics: ['repayments', 'loans', 'dashboard', 'reports'],
+    action: 'REPAYMENT_REVERSED',
+    entityId: savedRepayment._id,
+    staff: true,
+    userIds: [customerUserId]
   });
 
   res.json({ success: true, item: savedRepayment });

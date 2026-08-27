@@ -3,6 +3,7 @@ import Customer from '../models/Customer.js';
 import Role from '../models/Role.js';
 import User from '../models/User.js';
 import { ROLES } from '../constants/index.js';
+import { publishChange } from '../services/realtimeService.js';
 import { AppError } from '../utils/AppError.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
 import { nextNumber } from '../utils/counter.js';
@@ -100,7 +101,7 @@ export const registerCustomer = asyncHandler(async (req, res) => {
     throw new AppError('This phone number is already registered', 409);
   }
 
-  const savedUserId = await runDatabaseWork(async (session) => {
+  const registration = await runDatabaseWork(async (session) => {
       const [user] = await User.create(
         [{
           roleId: role._id,
@@ -113,7 +114,7 @@ export const registerCustomer = asyncHandler(async (req, res) => {
       );
 
       const customerCode = await nextNumber('customer', 'CUS', session);
-      await Customer.create(
+      const [customer] = await Customer.create(
         [{
           customerCode,
           userId: user._id,
@@ -127,10 +128,21 @@ export const registerCustomer = asyncHandler(async (req, res) => {
         sessionOptions(session)
       );
 
-      return user._id;
+      return {
+        userId: user._id,
+        customerId: customer._id
+      };
   });
 
-  const savedUser = await User.findById(savedUserId).populate('roleId');
+  const savedUser = await User.findById(registration.userId).populate('roleId');
+
+  publishChange({
+    topics: ['customers', 'dashboard'],
+    action: 'CUSTOMER_REGISTERED',
+    entityId: registration.customerId,
+    staff: true
+  });
+
   res.status(201).json({
     success: true,
     token: createToken(savedUser),

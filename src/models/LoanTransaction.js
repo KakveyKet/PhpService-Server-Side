@@ -8,6 +8,7 @@ const loanTransactionSchema = new mongoose.Schema(
       type: String,
       enum: [
         'DISBURSEMENT',
+        'WITHDRAWAL',
         'REPAYMENT',
         'INTEREST_CHARGE',
         'FEE_CHARGE',
