@@ -41,18 +41,6 @@ function positiveAmount(value) {
   }
 }
 
-function normalizeBankName(value) {
-  return String(value || '')
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, ' ')
-    .replace(/\s+/g, ' ');
-}
-
-function normalizeAccountNumber(value) {
-  return String(value || '').replace(/[^a-z0-9]/gi, '').toUpperCase();
-}
-
 function otpSecret() {
   const secret = process.env.OTP_PEPPER || process.env.JWT_SECRET;
   if (!secret) throw new AppError('OTP service is not configured', 503);
@@ -152,12 +140,6 @@ export const listWithdrawals = asyncHandler(async (req, res) => {
 export const createWithdrawal = asyncHandler(async (req, res) => {
   const amount = positiveAmount(req.body.amount);
   const loanId = requiredText(req.body.loanId, 'Loan');
-  const bankName = requiredText(req.body.bankName, 'Bank name');
-  const bankAccountNumber = requiredText(
-    req.body.bankAccountNumber,
-    'Bank account number',
-    80
-  );
 
   let savedWithdrawalId;
   let customerUserId = null;
@@ -177,6 +159,28 @@ export const createWithdrawal = asyncHandler(async (req, res) => {
         throw new AppError('Only an approved or active loan can be withdrawn', 409);
       }
 
+      const application = await LoanApplication.findById(loan.applicationId)
+        .select('applicantSnapshot')
+        .session(session);
+      if (!application) {
+        throw new AppError('The related loan application was not found', 409);
+      }
+
+      // New applications keep bank details in applicantSnapshot. The customer
+      // fields are a compatibility fallback for loans created before that update.
+      const bankName = String(
+        application.applicantSnapshot?.bankName || customer.bankName || ''
+      ).trim();
+      const bankAccountNumber = String(
+        application.applicantSnapshot?.bankAccountNumber || customer.bankNumber || ''
+      ).trim();
+      if (!bankName || !bankAccountNumber) {
+        throw new AppError(
+          'No bank information is saved with this loan application',
+          409
+        );
+      }
+
       const openRequest = await Withdrawal.exists({
         loanId: loan._id,
         isOpen: true
@@ -190,8 +194,6 @@ export const createWithdrawal = asyncHandler(async (req, res) => {
         throw new AppError('Withdrawal amount exceeds the available wallet balance', 422);
       }
 
-      const storedBankName = String(customer.bankName || '').trim();
-      const storedAccountNumber = String(customer.bankNumber || '').trim();
       const [withdrawal] = await Withdrawal.create(
         [{
           withdrawalNumber: await nextNumber('withdrawal', 'WDR', session),
@@ -200,15 +202,12 @@ export const createWithdrawal = asyncHandler(async (req, res) => {
           amount: toMoney(amount),
           requestedBank: { bankName, bankAccountNumber },
           customerBankSnapshot: {
-            bankName: storedBankName,
-            bankAccountNumber: storedAccountNumber
+            bankName,
+            bankAccountNumber
           },
           bankMatch: {
-            bankName: Boolean(storedBankName) &&
-              normalizeBankName(bankName) === normalizeBankName(storedBankName),
-            bankAccountNumber: Boolean(storedAccountNumber) &&
-              normalizeAccountNumber(bankAccountNumber) ===
-                normalizeAccountNumber(storedAccountNumber)
+            bankName: true,
+            bankAccountNumber: true
           },
           createdBy: req.user._id
         }],
@@ -223,7 +222,8 @@ export const createWithdrawal = asyncHandler(async (req, res) => {
         newValues: {
           loanId: loan._id,
           amount: withdrawal.amount,
-          bankMatch: withdrawal.bankMatch
+          bankSource: 'LOAN_APPLICATION',
+          applicationId: application._id
         },
         session
       });
