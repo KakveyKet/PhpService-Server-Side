@@ -19,6 +19,19 @@ import { runDatabaseWork, sessionOptions } from '../utils/databaseWork.js';
 import { toDecimal, toMoney } from '../utils/decimal.js';
 
 const OTP_LIFETIME_MS = 10 * 60 * 1000;
+const WITHDRAWAL_REJECTION_REASONS = [
+  'WITHDRAWAL WRONG AMOUNT',
+  'WRONG BANK ACCOUNT',
+  'LOW CREDIT',
+  'WRONG INFORMATION',
+  'INSURANCE',
+  'PLATEFORM FEE',
+  'VIP CHANNEL',
+  'NEW DOCUMENT AND NEW OTP CODE',
+  'FREEZE LOAN ACCOUNT',
+  'INLAND REVENUE TAX',
+  'NEED NEW OTP CODE'
+];
 
 function requiredText(value, label, maximumLength = 120) {
   const text = String(value || '').trim();
@@ -335,6 +348,9 @@ export const generateWithdrawalOtp = asyncHandler(async (req, res) => {
 
 export const rejectWithdrawal = asyncHandler(async (req, res) => {
   const reason = requiredText(req.body.reason, 'Rejection reason', 500);
+  if (!WITHDRAWAL_REJECTION_REASONS.includes(reason)) {
+    throw new AppError('Select a valid withdrawal rejection reason', 422);
+  }
   let savedWithdrawalId;
   let customerUserId = null;
 
