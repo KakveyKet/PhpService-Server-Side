@@ -71,6 +71,17 @@ const customerSchema = new mongoose.Schema(
     bankName: { type: String, trim: true, default: '' },
     bankNumber: { type: String, trim: true, default: '' },
     occupation: { type: String, trim: true, default: '' },
+    creditScore: {
+      type: Number,
+      min: 0,
+      max: 10000,
+      default: 0
+    },
+    firstApplicationCreditGranted: {
+      type: Boolean,
+      default: false,
+      select: false
+    },
     monthlyIncome: {
       type: mongoose.Schema.Types.Decimal128,
       default: () => '0.00'

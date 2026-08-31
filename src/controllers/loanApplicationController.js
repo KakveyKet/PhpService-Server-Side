@@ -16,6 +16,23 @@ import { runDatabaseWork, sessionOptions } from '../utils/databaseWork.js';
 import { toDecimal, toMoney } from '../utils/decimal.js';
 
 const CUSTOMER_TERM_OPTIONS = [6, 12, 24, 36, 48];
+const FIRST_APPLICATION_CREDIT_SCORE = 250;
+
+async function grantFirstApplicationCredit(customerId) {
+  const updatedCustomer = await Customer.findOneAndUpdate(
+    {
+      _id: customerId,
+      firstApplicationCreditGranted: { $ne: true }
+    },
+    {
+      $max: { creditScore: FIRST_APPLICATION_CREDIT_SCORE },
+      $set: { firstApplicationCreditGranted: true }
+    },
+    { new: true }
+  );
+
+  return Boolean(updatedCustomer);
+}
 
 function uploadPrivateImage(buffer, options) {
   const cloudinary = getCloudinary();
@@ -285,6 +302,8 @@ export const createApplication = asyncHandler(async (req, res) => {
       createdBy: req.user._id
     });
 
+    const initialCreditGranted = await grantFirstApplicationCredit(customer._id);
+
     await writeAudit({
       req,
       action: 'LOAN_APPLICATION_CREATED',
@@ -296,12 +315,16 @@ export const createApplication = asyncHandler(async (req, res) => {
         requestedTerm: term,
         termsAcceptedAt,
         identityImagesSubmitted: true,
-        signatureSubmitted: true
+        signatureSubmitted: true,
+        initialCreditGranted,
+        creditScore: initialCreditGranted
+          ? FIRST_APPLICATION_CREDIT_SCORE
+          : undefined
       }
     });
 
     publishChange({
-      topics: ['applications', 'dashboard', 'customers'],
+      topics: ['applications', 'dashboard', 'customers', 'profile'],
       action: 'LOAN_APPLICATION_CREATED',
       entityId: application._id,
       staff: true,
@@ -326,10 +349,24 @@ export const createApplication = asyncHandler(async (req, res) => {
     createdBy: req.user._id
   });
 
-  await writeAudit({ req, action: 'LOAN_APPLICATION_CREATED', entityType: 'LOAN_APPLICATION', entityId: application._id, newValues: req.body });
+  const initialCreditGranted = await grantFirstApplicationCredit(customer._id);
+
+  await writeAudit({
+    req,
+    action: 'LOAN_APPLICATION_CREATED',
+    entityType: 'LOAN_APPLICATION',
+    entityId: application._id,
+    newValues: {
+      ...req.body,
+      initialCreditGranted,
+      creditScore: initialCreditGranted
+        ? FIRST_APPLICATION_CREDIT_SCORE
+        : undefined
+    }
+  });
 
   publishChange({
-    topics: ['applications', 'dashboard'],
+    topics: ['applications', 'dashboard', 'customers', 'profile'],
     action: 'LOAN_APPLICATION_CREATED',
     entityId: application._id,
     staff: true,
