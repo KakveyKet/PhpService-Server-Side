@@ -546,6 +546,17 @@ export const approveWithdrawal = asyncHandler(async (req, res) => {
       throw new AppError('The related loan is no longer eligible for withdrawal', 409);
     }
 
+    // Recheck at the moment of approval. Pending requests do not reduce the
+    // displayed wallet balance, but an approval must never exceed the money
+    // that is actually still available.
+    const wallet = await walletSummaryForLoan(loan, session);
+    if (toDecimal(withdrawal.amount).gt(toDecimal(wallet.availableBalance))) {
+      throw new AppError(
+        'Withdrawal amount exceeds the available wallet balance',
+        409
+      );
+    }
+
     const now = new Date();
     const automaticallyDisbursed = loan.status === 'APPROVED';
 

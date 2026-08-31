@@ -79,6 +79,15 @@ function privateImageUrl(image) {
   };
 }
 
+function maskExceptLastThree(value) {
+  const characters = Array.from(String(value || '').trim());
+
+  if (!characters.length) return '—';
+  if (characters.length <= 3) return 'x'.repeat(characters.length);
+
+  return `${'x'.repeat(characters.length - 3)}${characters.slice(-3).join('')}`;
+}
+
 export const listCustomers = asyncHandler(async (req, res) => {
   const page = Math.max(Number(req.query.page) || 1, 1);
   const limit = Math.min(Math.max(Number(req.query.limit) || 20, 1), 100);
@@ -122,32 +131,7 @@ export const getMyCustomer = asyncHandler(async (req, res) => {
     throw new AppError('Customer account required', 403);
   }
 
-  // Bank details are intentionally excluded from the normal profile response.
-  // The customer must verify their password through getMyBankDetails first.
-  const customer = await Customer.findOne({ userId: req.user._id }).select(
-    '-bankName -bankNumber'
-  );
-  if (!customer) throw new AppError('Customer profile not found', 404);
-
-  res.json({ success: true, item: customer });
-});
-
-export const getMyBankDetails = asyncHandler(async (req, res) => {
-  if (req.role !== ROLES.CUSTOMER) {
-    throw new AppError('Customer account required', 403);
-  }
-
-  const password = String(req.body.password || '');
-  if (!password) throw new AppError('Your password is required', 422);
-
-  const user = await User.findById(req.user._id).select('+passwordHash');
-  if (!user || !(await user.comparePassword(password))) {
-    throw new AppError('Incorrect password', 422);
-  }
-
-  const customer = await Customer.findOne({ userId: req.user._id }).select(
-    'name firstName middleName lastName bankName bankNumber'
-  );
+  const customer = await Customer.findOne({ userId: req.user._id });
   if (!customer) throw new AppError('Customer profile not found', 404);
 
   const accountHolderName = customer.name ||
@@ -156,15 +140,18 @@ export const getMyBankDetails = asyncHandler(async (req, res) => {
       .join(' ') ||
     '—';
 
+  const item = customer.toObject({ virtuals: true });
+  delete item.bankName;
+  delete item.bankNumber;
+
+  item.maskedBankDetails = {
+    accountHolderName: maskExceptLastThree(accountHolderName),
+    bankName: customer.bankName || '—',
+    bankAccountNumber: maskExceptLastThree(customer.bankNumber)
+  };
+
   res.set('Cache-Control', 'no-store');
-  res.json({
-    success: true,
-    item: {
-      accountHolderName,
-      bankName: customer.bankName || '—',
-      bankAccountNumber: customer.bankNumber || '—'
-    }
-  });
+  res.json({ success: true, item });
 });
 
 export const getCustomer = asyncHandler(async (req, res) => {

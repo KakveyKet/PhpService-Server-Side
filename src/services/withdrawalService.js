@@ -66,11 +66,12 @@ export async function withdrawalTotalsForLoan(loanId, session = null) {
   };
 }
 
-export async function walletSummaryForLoan(loan, session = null) {
-  await expireWithdrawalOtps(session);
-  const totals = await withdrawalTotalsForLoan(loan._id, session);
-  const principal = toDecimal(loan.principalAmount);
-  const available = principal.minus(totals.committed);
+export function walletSummaryFromTotals(principalAmount, totals) {
+  const principal = toDecimal(principalAmount);
+
+  // A request does not change the customer's visible balance. Money leaves
+  // the wallet only after an Admin or Super Admin approves the withdrawal.
+  const available = principal.minus(totals.withdrawn);
 
   return {
     availableBalance: toMoney(available.lessThan(0) ? 0 : available),
@@ -78,4 +79,10 @@ export async function walletSummaryForLoan(loan, session = null) {
     withdrawnAmount: toMoney(totals.withdrawn),
     originalBalance: toMoney(principal)
   };
+}
+
+export async function walletSummaryForLoan(loan, session = null) {
+  await expireWithdrawalOtps(session);
+  const totals = await withdrawalTotalsForLoan(loan._id, session);
+  return walletSummaryFromTotals(loan.principalAmount, totals);
 }
