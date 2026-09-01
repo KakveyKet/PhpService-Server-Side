@@ -1,12 +1,12 @@
 import { Router } from 'express';
 import rateLimit from 'express-rate-limit';
 import {
-  approveWithdrawal,
   createWithdrawal,
-  generateWithdrawalOtp,
   listWithdrawals,
+  rejectCompletedWithdrawal,
   rejectWithdrawal,
-  verifyWithdrawalOtp
+  setWithdrawalCode,
+  verifyWithdrawalCode
 } from '../controllers/withdrawalController.js';
 import { ROLES } from '../constants/index.js';
 import { allowRoles, authenticate } from '../middleware/auth.js';
@@ -26,14 +26,9 @@ router.post(
   createWithdrawal
 );
 router.post(
-  '/:id/generate-otp',
+  '/:id/set-code',
   allowRoles(ROLES.ADMIN, ROLES.SUPER_ADMIN),
-  generateWithdrawalOtp
-);
-router.post(
-  '/:id/approve',
-  allowRoles(ROLES.ADMIN, ROLES.SUPER_ADMIN),
-  approveWithdrawal
+  setWithdrawalCode
 );
 router.post(
   '/:id/reject',
@@ -41,10 +36,15 @@ router.post(
   rejectWithdrawal
 );
 router.post(
-  '/:id/verify-otp',
+  '/:id/verify-code',
   rateLimit({ windowMs: 15 * 60 * 1000, limit: 20 }),
   allowRoles(ROLES.CUSTOMER),
-  verifyWithdrawalOtp
+  verifyWithdrawalCode
+);
+router.post(
+  '/:id/reject-completed',
+  allowRoles(ROLES.ADMIN, ROLES.SUPER_ADMIN),
+  rejectCompletedWithdrawal
 );
 
 export default router;

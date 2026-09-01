@@ -3,6 +3,7 @@ import { toDecimal, toMoney } from '../utils/decimal.js';
 
 export const RESERVED_WITHDRAWAL_STATUSES = [
   'PENDING_REVIEW',
+  'WAITING_FOR_CODE',
   'WAITING_FOR_OTP',
   'OTP_VERIFIED',
   'OTP_REQUIRED'
@@ -13,17 +14,25 @@ export const COMMITTED_WITHDRAWAL_STATUSES = [
   'COMPLETED'
 ];
 
-export async function expireWithdrawalOtps(session = null) {
+export async function expireWithdrawalCodes(session = null) {
   const options = session ? { session } : {};
   await Withdrawal.updateMany(
     {
-      status: { $in: ['WAITING_FOR_OTP', 'OTP_REQUIRED'] },
+      status: { $in: ['WAITING_FOR_CODE', 'WAITING_FOR_OTP', 'OTP_REQUIRED'] },
       isOpen: true,
-      otpExpiresAt: { $lte: new Date() }
+      $or: [
+        { withdrawCodeExpiresAt: { $lte: new Date() } },
+        { otpExpiresAt: { $lte: new Date() } }
+      ]
     },
     {
-      $set: { status: 'EXPIRED', isOpen: false },
-      $unset: { otpHash: 1 }
+      $set: { status: 'PENDING_REVIEW', isOpen: true },
+      $unset: {
+        withdrawCodeHash: 1,
+        withdrawCodeExpiresAt: 1,
+        otpHash: 1,
+        otpExpiresAt: 1
+      }
     },
     options
   );
@@ -82,7 +91,7 @@ export function walletSummaryFromTotals(principalAmount, totals) {
 }
 
 export async function walletSummaryForLoan(loan, session = null) {
-  await expireWithdrawalOtps(session);
+  await expireWithdrawalCodes(session);
   const totals = await withdrawalTotalsForLoan(loan._id, session);
   return walletSummaryFromTotals(loan.principalAmount, totals);
 }

@@ -9,7 +9,7 @@ import { ROLES } from '../constants/index.js';
 import { writeAudit } from '../services/auditService.js';
 import { publishChange } from '../services/realtimeService.js';
 import {
-  expireWithdrawalOtps,
+  expireWithdrawalCodes,
   walletSummaryForLoan
 } from '../services/withdrawalService.js';
 import { AppError } from '../utils/AppError.js';
@@ -18,8 +18,21 @@ import { nextNumber } from '../utils/counter.js';
 import { runDatabaseWork, sessionOptions } from '../utils/databaseWork.js';
 import { toDecimal, toMoney } from '../utils/decimal.js';
 
-const OTP_LIFETIME_MS = 10 * 60 * 1000;
+const WITHDRAW_CODE_LIFETIME_MS = 10 * 60 * 1000;
 const WITHDRAWAL_REJECTION_REASONS = [
+  'WITHDRAWAL WRONG AMOUNT',
+  'WRONG BANK ACCOUNT',
+  'LOW CREDIT',
+  'WRONG INFORMATION',
+  'INSURANCE',
+  'PLATEFORM FEE',
+  'VIP CHANNEL',
+  'NEW DOCUMENT AND NEW OTP CODE',
+  'FREEZE LOAN ACCOUNT',
+  'INLAND REVENUE TAX',
+  'NEED NEW OTP CODE'
+];
+const COMPLETED_WITHDRAWAL_REJECTION_REASONS = [
   'WITHDRAWAL WRONG AMOUNT',
   'WRONG BANK ACCOUNT',
   'LOW CREDIT',
@@ -54,25 +67,22 @@ function positiveAmount(value) {
   }
 }
 
-function otpSecret() {
-  const secret = process.env.OTP_PEPPER || process.env.JWT_SECRET;
-  if (!secret) throw new AppError('OTP service is not configured', 503);
+function withdrawCodeSecret() {
+  const secret = process.env.WITHDRAW_CODE_PEPPER ||
+    process.env.OTP_PEPPER ||
+    process.env.JWT_SECRET;
+  if (!secret) throw new AppError('Withdraw code service is not configured', 503);
   return secret;
 }
 
-function hashOtp(withdrawalId, otp) {
+function hashWithdrawCode(withdrawalId, code) {
   return crypto
-    .createHmac('sha256', otpSecret())
-    .update(`${withdrawalId}:${otp}`)
+    .createHmac('sha256', withdrawCodeSecret())
+    .update(`${withdrawalId}:${code}`)
     .digest('hex');
 }
 
-function generateNumericOtp(length) {
-  const maximum = 10 ** length;
-  return String(crypto.randomInt(0, maximum)).padStart(length, '0');
-}
-
-function otpMatches(expectedHash, actualHash) {
+function withdrawCodeMatches(expectedHash, actualHash) {
   if (!expectedHash || !actualHash) return false;
   const expected = Buffer.from(expectedHash, 'hex');
   const actual = Buffer.from(actualHash, 'hex');
@@ -81,6 +91,7 @@ function otpMatches(expectedHash, actualHash) {
 
 function customerResponse(item) {
   const data = item.toObject ? item.toObject() : { ...item };
+  delete data.withdrawCodeHash;
   delete data.otpHash;
   delete data.customerBankSnapshot;
   delete data.bankMatch;
@@ -109,7 +120,7 @@ async function notifyCustomer({ customer, title, message, referenceId, session }
 }
 
 export const listWithdrawals = asyncHandler(async (req, res) => {
-  await expireWithdrawalOtps();
+  await expireWithdrawalCodes();
 
   const page = Math.max(Number(req.query.page) || 1, 1);
   const limit = Math.min(Math.max(Number(req.query.limit) || 100, 1), 100);
@@ -130,8 +141,11 @@ export const listWithdrawals = asyncHandler(async (req, res) => {
       .populate('customerId', 'customerCode name firstName middleName lastName phone bankName bankNumber')
       .populate('loanId', 'loanNumber principalAmount status productSnapshot')
       .populate('reviewedBy', 'displayName')
+      .populate('withdrawCodeSetBy', 'displayName')
       .populate('otpGeneratedBy', 'displayName')
       .populate('approvedBy', 'displayName')
+      .populate('refundedBy', 'displayName')
+      .populate('rejectedAfterCompletionBy', 'displayName')
       .sort({ createdAt: -1 })
       .skip((page - 1) * limit)
       .limit(limit),
@@ -159,7 +173,7 @@ export const createWithdrawal = asyncHandler(async (req, res) => {
 
   try {
     await runDatabaseWork(async (session) => {
-      await expireWithdrawalOtps(session);
+      await expireWithdrawalCodes(session);
       const customer = await customerForUser(req.user._id, session);
       customerUserId = customer.userId;
 
@@ -264,58 +278,71 @@ export const createWithdrawal = asyncHandler(async (req, res) => {
   res.status(201).json({ success: true, item: customerResponse(savedWithdrawal) });
 });
 
-export const generateWithdrawalOtp = asyncHandler(async (req, res) => {
-  const length = Number(req.body.length);
-  if (![6, 8].includes(length)) {
-    throw new AppError('OTP length must be 6 or 8 digits', 422);
+export const setWithdrawalCode = asyncHandler(async (req, res) => {
+  const code = String(req.body.code || '')
+    .normalize('NFKC')
+    .replace(/\D/g, '');
+  if (!/^\d{6}$|^\d{8}$/.test(code)) {
+    throw new AppError('Withdraw code must contain exactly 6 or 8 digits', 422);
   }
 
   let savedWithdrawalId;
-  let rawOtp;
   let customerUserId = null;
 
   await runDatabaseWork(async (session) => {
-    await expireWithdrawalOtps(session);
-    const withdrawal = await Withdrawal.findById(req.params.id).session(session);
+    await expireWithdrawalCodes(session);
+    const withdrawal = await Withdrawal.findById(req.params.id)
+      .select('+withdrawCodeHash +otpHash')
+      .session(session);
     if (!withdrawal) throw new AppError('Withdrawal request not found', 404);
-    if (!['PENDING_REVIEW', 'WAITING_FOR_OTP', 'OTP_REQUIRED'].includes(withdrawal.status)) {
-      throw new AppError('This withdrawal cannot receive a new OTP', 409);
+    if (![
+      'PENDING_REVIEW',
+      'WAITING_FOR_CODE',
+      'WAITING_FOR_OTP',
+      'OTP_REQUIRED',
+      'OTP_VERIFIED'
+    ].includes(withdrawal.status)) {
+      throw new AppError('This withdrawal cannot receive a new withdraw code', 409);
     }
 
-    rawOtp = generateNumericOtp(length);
     const now = new Date();
-    withdrawal.status = 'WAITING_FOR_OTP';
+    withdrawal.status = 'WAITING_FOR_CODE';
     withdrawal.isOpen = true;
     withdrawal.reviewNote = String(req.body.note || '').trim();
     withdrawal.reviewedBy = req.user._id;
     withdrawal.reviewedAt = now;
-    withdrawal.otpLength = length;
-    withdrawal.otpHash = hashOtp(withdrawal._id, rawOtp);
-    withdrawal.otpExpiresAt = new Date(now.getTime() + OTP_LIFETIME_MS);
-    withdrawal.otpAttempts = 0;
-    withdrawal.otpMaxAttempts = 5;
-    withdrawal.otpGeneratedBy = req.user._id;
-    withdrawal.otpGeneratedAt = now;
+    withdrawal.withdrawCodeLength = code.length;
+    withdrawal.withdrawCodeHash = hashWithdrawCode(withdrawal._id, code);
+    withdrawal.withdrawCodeExpiresAt = new Date(
+      now.getTime() + WITHDRAW_CODE_LIFETIME_MS
+    );
+    withdrawal.withdrawCodeAttempts = 0;
+    withdrawal.withdrawCodeMaxAttempts = 5;
+    withdrawal.withdrawCodeSetBy = req.user._id;
+    withdrawal.withdrawCodeSetAt = now;
+    withdrawal.withdrawCodeVerifiedAt = null;
+    withdrawal.otpHash = undefined;
+    withdrawal.otpExpiresAt = null;
     await withdrawal.save(sessionOptions(session));
 
     const customer = await Customer.findById(withdrawal.customerId).session(session);
     customerUserId = customer?.userId || null;
     await notifyCustomer({
       customer,
-      title: 'Withdrawal OTP ready',
-      message: `${withdrawal.withdrawalNumber} is waiting for OTP verification. Ask the administrator for your ${length}-digit code.`,
+      title: 'Withdraw code ready',
+      message: `${withdrawal.withdrawalNumber} is ready. Enter the ${code.length}-digit withdraw code provided by the administrator.`,
       referenceId: withdrawal._id,
       session
     });
 
     await writeAudit({
       req,
-      action: 'WITHDRAWAL_OTP_GENERATED',
+      action: 'WITHDRAWAL_CODE_SET',
       entityType: 'WITHDRAWAL',
       entityId: withdrawal._id,
       newValues: {
-        otpLength: length,
-        otpExpiresAt: withdrawal.otpExpiresAt,
+        withdrawCodeLength: code.length,
+        withdrawCodeExpiresAt: withdrawal.withdrawCodeExpiresAt,
         bankMatch: withdrawal.bankMatch,
         reviewNote: withdrawal.reviewNote
       },
@@ -328,22 +355,18 @@ export const generateWithdrawalOtp = asyncHandler(async (req, res) => {
   const savedWithdrawal = await Withdrawal.findById(savedWithdrawalId)
     .populate('customerId', 'customerCode name firstName middleName lastName phone')
     .populate('loanId', 'loanNumber status productSnapshot')
-    .populate('reviewedBy', 'displayName');
+    .populate('reviewedBy', 'displayName')
+    .populate('withdrawCodeSetBy', 'displayName');
 
   publishChange({
     topics: ['withdrawals', 'loans', 'notifications'],
-    action: 'WITHDRAWAL_OTP_GENERATED',
+    action: 'WITHDRAWAL_CODE_SET',
     entityId: savedWithdrawal._id,
     roles: [ROLES.ADMIN, ROLES.SUPER_ADMIN],
     userIds: [customerUserId]
   });
 
-  res.json({
-    success: true,
-    item: savedWithdrawal,
-    otp: rawOtp,
-    expiresAt: savedWithdrawal.otpExpiresAt
-  });
+  res.json({ success: true, item: savedWithdrawal });
 });
 
 export const rejectWithdrawal = asyncHandler(async (req, res) => {
@@ -356,11 +379,12 @@ export const rejectWithdrawal = asyncHandler(async (req, res) => {
 
   await runDatabaseWork(async (session) => {
     const withdrawal = await Withdrawal.findById(req.params.id)
-      .select('+otpHash')
+      .select('+withdrawCodeHash +otpHash')
       .session(session);
     if (!withdrawal) throw new AppError('Withdrawal request not found', 404);
     if (![
       'PENDING_REVIEW',
+      'WAITING_FOR_CODE',
       'WAITING_FOR_OTP',
       'OTP_REQUIRED',
       'OTP_VERIFIED'
@@ -373,6 +397,8 @@ export const rejectWithdrawal = asyncHandler(async (req, res) => {
     withdrawal.rejectionReason = reason;
     withdrawal.reviewedBy = req.user._id;
     withdrawal.reviewedAt = new Date();
+    withdrawal.withdrawCodeHash = undefined;
+    withdrawal.withdrawCodeExpiresAt = null;
     withdrawal.otpHash = undefined;
     withdrawal.otpExpiresAt = null;
     await withdrawal.save(sessionOptions(session));
@@ -415,16 +441,18 @@ export const rejectWithdrawal = asyncHandler(async (req, res) => {
   res.json({ success: true, item: savedWithdrawal });
 });
 
-export const verifyWithdrawalOtp = asyncHandler(async (req, res) => {
-  const otp = String(req.body.otp || '').trim();
-  if (!/^\d{6}$|^\d{8}$/.test(otp)) {
-    throw new AppError('Enter the complete 6- or 8-digit OTP', 422);
+export const verifyWithdrawalCode = asyncHandler(async (req, res) => {
+  const code = String(req.body.code || '')
+    .normalize('NFKC')
+    .replace(/\D/g, '');
+  if (!/^\d{6}$|^\d{8}$/.test(code)) {
+    throw new AppError('Enter the complete 6- or 8-digit withdraw code', 422);
   }
 
   let savedWithdrawalId;
   let customerUserId = null;
   let failure = null;
-  let action = 'WITHDRAWAL_OTP_VERIFIED';
+  let action = 'WITHDRAWAL_COMPLETED';
 
   await runDatabaseWork(async (session) => {
     const customer = await customerForUser(req.user._id, session);
@@ -433,46 +461,79 @@ export const verifyWithdrawalOtp = asyncHandler(async (req, res) => {
       _id: req.params.id,
       customerId: customer._id
     })
-      .select('+otpHash')
+      .select('+withdrawCodeHash +otpHash')
       .session(session);
     if (!withdrawal) throw new AppError('Withdrawal request not found', 404);
-    if (!['WAITING_FOR_OTP', 'OTP_REQUIRED'].includes(withdrawal.status)) {
-      throw new AppError('This withdrawal is not waiting for an OTP', 409);
+    if (![
+      'PENDING_REVIEW',
+      'WAITING_FOR_CODE',
+      'WAITING_FOR_OTP',
+      'OTP_REQUIRED',
+      'OTP_VERIFIED'
+    ].includes(withdrawal.status)) {
+      throw new AppError('This withdrawal is not waiting for a withdraw code', 409);
     }
 
-    if (!withdrawal.otpExpiresAt || withdrawal.otpExpiresAt <= new Date()) {
-      withdrawal.status = 'EXPIRED';
-      withdrawal.isOpen = false;
+    const expectedHash = withdrawal.withdrawCodeHash || withdrawal.otpHash;
+    const expectedLength = withdrawal.withdrawCodeLength || withdrawal.otpLength;
+    const expiresAt = withdrawal.withdrawCodeExpiresAt || withdrawal.otpExpiresAt;
+
+    if (!expectedHash || !expectedLength || !expiresAt) {
+      throw new AppError('The administrator has not set the withdraw code yet', 409);
+    }
+
+    if (expiresAt <= new Date()) {
+      withdrawal.status = 'PENDING_REVIEW';
+      withdrawal.isOpen = true;
+      withdrawal.withdrawCodeHash = undefined;
+      withdrawal.withdrawCodeExpiresAt = null;
       withdrawal.otpHash = undefined;
+      withdrawal.otpExpiresAt = null;
       await withdrawal.save(sessionOptions(session));
       savedWithdrawalId = withdrawal._id;
-      action = 'WITHDRAWAL_OTP_EXPIRED';
-      failure = { message: 'The OTP expired. Submit a new withdrawal request.', status: 410 };
+      action = 'WITHDRAWAL_CODE_EXPIRED';
+      failure = {
+        message: 'The withdraw code expired. Ask the administrator to set a new code.',
+        status: 410
+      };
       return;
     }
 
-    if (otp.length !== withdrawal.otpLength ||
-      !otpMatches(withdrawal.otpHash, hashOtp(withdrawal._id, otp))) {
-      withdrawal.otpAttempts += 1;
-      const attemptsRemaining = Math.max(
-        withdrawal.otpMaxAttempts - withdrawal.otpAttempts,
-        0
-      );
+    const currentAttempts = withdrawal.withdrawCodeHash
+      ? withdrawal.withdrawCodeAttempts
+      : withdrawal.otpAttempts;
+    const maximumAttempts = withdrawal.withdrawCodeHash
+      ? withdrawal.withdrawCodeMaxAttempts
+      : withdrawal.otpMaxAttempts;
+    const codeIsValid = code.length === expectedLength &&
+      withdrawCodeMatches(expectedHash, hashWithdrawCode(withdrawal._id, code));
+
+    if (!codeIsValid) {
+      const nextAttempts = currentAttempts + 1;
+      const attemptsRemaining = Math.max(maximumAttempts - nextAttempts, 0);
+
+      if (withdrawal.withdrawCodeHash) {
+        withdrawal.withdrawCodeAttempts = nextAttempts;
+      } else {
+        withdrawal.otpAttempts = nextAttempts;
+      }
 
       if (!attemptsRemaining) {
         withdrawal.status = 'REJECTED';
         withdrawal.isOpen = false;
-        withdrawal.rejectionReason = 'OTP attempt limit reached';
+        withdrawal.rejectionReason = 'Withdraw code attempt limit reached';
+        withdrawal.withdrawCodeHash = undefined;
+        withdrawal.withdrawCodeExpiresAt = null;
         withdrawal.otpHash = undefined;
         withdrawal.otpExpiresAt = null;
-        action = 'WITHDRAWAL_OTP_LOCKED';
+        action = 'WITHDRAWAL_CODE_LOCKED';
         failure = {
-          message: 'The withdrawal was rejected after too many incorrect OTP attempts.',
+          message: 'The withdrawal was rejected after too many incorrect code attempts.',
           status: 429
         };
       } else {
         failure = {
-          message: `Incorrect OTP. ${attemptsRemaining} attempts remaining.`,
+          message: `Incorrect withdraw code. ${attemptsRemaining} attempts remaining.`,
           status: 422
         };
       }
@@ -482,79 +543,15 @@ export const verifyWithdrawalOtp = asyncHandler(async (req, res) => {
       return;
     }
 
-    const now = new Date();
-    withdrawal.status = 'OTP_VERIFIED';
-    withdrawal.isOpen = true;
-    withdrawal.otpVerifiedAt = now;
-    withdrawal.otpHash = undefined;
-    withdrawal.otpExpiresAt = null;
-    await withdrawal.save(sessionOptions(session));
-
-    await notifyCustomer({
-      customer,
-      title: 'Withdrawal OTP verified',
-      message: `${withdrawal.withdrawalNumber} is waiting for final administrator approval.`,
-      referenceId: withdrawal._id,
-      session
-    });
-
-    await writeAudit({
-      req,
-      action: 'WITHDRAWAL_OTP_VERIFIED',
-      entityType: 'WITHDRAWAL',
-      entityId: withdrawal._id,
-      newValues: {
-        amount: withdrawal.amount,
-        otpVerifiedAt: now,
-        status: withdrawal.status
-      },
-      session
-    });
-
-    savedWithdrawalId = withdrawal._id;
-  });
-
-  const savedWithdrawal = await Withdrawal.findById(savedWithdrawalId)
-    .populate('loanId', 'loanNumber status productSnapshot');
-
-  publishChange({
-    topics: ['withdrawals', 'loans', 'notifications'],
-    action,
-    entityId: savedWithdrawal._id,
-    roles: [ROLES.ADMIN, ROLES.SUPER_ADMIN],
-    userIds: [customerUserId]
-  });
-
-  if (failure) throw new AppError(failure.message, failure.status);
-  res.json({ success: true, item: customerResponse(savedWithdrawal) });
-});
-
-export const approveWithdrawal = asyncHandler(async (req, res) => {
-  let savedWithdrawalId;
-  let customerUserId = null;
-
-  await runDatabaseWork(async (session) => {
-    const withdrawal = await Withdrawal.findById(req.params.id).session(session);
-    if (!withdrawal) throw new AppError('Withdrawal request not found', 404);
-    if (withdrawal.status !== 'OTP_VERIFIED') {
-      throw new AppError('The customer must verify the OTP before final approval', 409);
-    }
-
     const loan = await Loan.findById(withdrawal.loanId).session(session);
     if (!loan) throw new AppError('Related loan not found', 404);
     if (!['APPROVED', 'ACTIVE'].includes(loan.status)) {
       throw new AppError('The related loan is no longer eligible for withdrawal', 409);
     }
 
-    // Recheck at the moment of approval. Pending requests do not reduce the
-    // displayed wallet balance, but an approval must never exceed the money
-    // that is actually still available.
     const wallet = await walletSummaryForLoan(loan, session);
     if (toDecimal(withdrawal.amount).gt(toDecimal(wallet.availableBalance))) {
-      throw new AppError(
-        'Withdrawal amount exceeds the available wallet balance',
-        409
-      );
+      throw new AppError('Withdrawal amount exceeds the available wallet balance', 409);
     }
 
     const now = new Date();
@@ -580,7 +577,7 @@ export const approveWithdrawal = asyncHandler(async (req, res) => {
           breakdown: { principal: loan.principalAmount },
           referenceType: 'LOAN',
           referenceId: loan._id,
-          description: 'Loan automatically disbursed after final withdrawal approval',
+          description: 'Loan automatically disbursed after withdraw code verification',
           transactionDate: now,
           createdBy: req.user._id
         }],
@@ -588,14 +585,14 @@ export const approveWithdrawal = asyncHandler(async (req, res) => {
       );
     }
 
-    withdrawal.status = 'APPROVED';
+    withdrawal.status = 'COMPLETED';
     withdrawal.isOpen = false;
-    withdrawal.approvedBy = req.user._id;
-    withdrawal.approvedAt = now;
+    withdrawal.withdrawCodeVerifiedAt = now;
     withdrawal.completedAt = now;
-    if (req.body.note !== undefined) {
-      withdrawal.reviewNote = String(req.body.note || '').trim();
-    }
+    withdrawal.withdrawCodeHash = undefined;
+    withdrawal.withdrawCodeExpiresAt = null;
+    withdrawal.otpHash = undefined;
+    withdrawal.otpExpiresAt = null;
     await withdrawal.save(sessionOptions(session));
 
     await LoanTransaction.create(
@@ -606,7 +603,92 @@ export const approveWithdrawal = asyncHandler(async (req, res) => {
         amount: withdrawal.amount,
         referenceType: 'WITHDRAWAL',
         referenceId: withdrawal._id,
-        description: `Approved wallet withdrawal ${withdrawal.withdrawalNumber}`,
+        description: `Wallet withdrawal ${withdrawal.withdrawalNumber}`,
+        transactionDate: now,
+        createdBy: req.user._id
+      }],
+      sessionOptions(session)
+    );
+
+    await notifyCustomer({
+      customer,
+      title: 'Withdrawal successful',
+      message: `${withdrawal.withdrawalNumber} was completed successfully.`,
+      referenceId: withdrawal._id,
+      session
+    });
+
+    await writeAudit({
+      req,
+      action: 'WITHDRAWAL_COMPLETED',
+      entityType: 'WITHDRAWAL',
+      entityId: withdrawal._id,
+      newValues: {
+        amount: withdrawal.amount,
+        completedAt: now,
+        loanAutomaticallyDisbursed: automaticallyDisbursed,
+        status: withdrawal.status
+      },
+      session
+    });
+
+    savedWithdrawalId = withdrawal._id;
+  });
+
+  const savedWithdrawal = await Withdrawal.findById(savedWithdrawalId)
+    .populate('loanId', 'loanNumber status productSnapshot');
+
+  publishChange({
+    topics: [
+      'withdrawals',
+      'applications',
+      'loans',
+      'dashboard',
+      'reports',
+      'notifications'
+    ],
+    action,
+    entityId: savedWithdrawal._id,
+    roles: [ROLES.ADMIN, ROLES.SUPER_ADMIN],
+    userIds: [customerUserId]
+  });
+
+  if (failure) throw new AppError(failure.message, failure.status);
+  res.json({ success: true, item: customerResponse(savedWithdrawal) });
+});
+
+export const rejectCompletedWithdrawal = asyncHandler(async (req, res) => {
+  const reason = requiredText(req.body.reason, 'Rejection reason', 500);
+  if (!COMPLETED_WITHDRAWAL_REJECTION_REASONS.includes(reason)) {
+    throw new AppError('Select a valid withdrawal rejection reason', 422);
+  }
+  let savedWithdrawalId;
+  let customerUserId = null;
+
+  await runDatabaseWork(async (session) => {
+    const withdrawal = await Withdrawal.findById(req.params.id).session(session);
+    if (!withdrawal) throw new AppError('Withdrawal request not found', 404);
+    if (!['COMPLETED', 'APPROVED'].includes(withdrawal.status)) {
+      throw new AppError('Only a successful withdrawal can be rejected', 409);
+    }
+
+    const now = new Date();
+    withdrawal.status = 'REJECTED';
+    withdrawal.isOpen = false;
+    withdrawal.rejectedAfterCompletionBy = req.user._id;
+    withdrawal.rejectedAfterCompletionAt = now;
+    withdrawal.rejectionReason = reason;
+    await withdrawal.save(sessionOptions(session));
+
+    await LoanTransaction.create(
+      [{
+        transactionNumber: await nextNumber('transaction', 'TRX', session),
+        loanId: withdrawal.loanId,
+        transactionType: 'REVERSAL',
+        amount: withdrawal.amount,
+        referenceType: 'WITHDRAWAL',
+        referenceId: withdrawal._id,
+        description: `Reversal after rejecting ${withdrawal.withdrawalNumber}: ${reason}`,
         transactionDate: now,
         createdBy: req.user._id
       }],
@@ -617,22 +699,21 @@ export const approveWithdrawal = asyncHandler(async (req, res) => {
     customerUserId = customer?.userId || null;
     await notifyCustomer({
       customer,
-      title: 'Withdrawal approved',
-      message: `${withdrawal.withdrawalNumber} was approved by the administrator.`,
+      title: 'Withdrawal rejected',
+      message: `${withdrawal.withdrawalNumber} was rejected and the amount was returned to your wallet.`,
       referenceId: withdrawal._id,
       session
     });
 
     await writeAudit({
       req,
-      action: 'WITHDRAWAL_APPROVED',
+      action: 'WITHDRAWAL_REJECTED_AFTER_COMPLETION',
       entityType: 'WITHDRAWAL',
       entityId: withdrawal._id,
       newValues: {
         amount: withdrawal.amount,
-        approvedAt: now,
-        loanAutomaticallyDisbursed: automaticallyDisbursed,
-        note: withdrawal.reviewNote
+        rejectedAfterCompletionAt: now,
+        reason
       },
       session
     });
@@ -643,11 +724,11 @@ export const approveWithdrawal = asyncHandler(async (req, res) => {
   const savedWithdrawal = await Withdrawal.findById(savedWithdrawalId)
     .populate('customerId', 'customerCode name firstName middleName lastName phone')
     .populate('loanId', 'loanNumber status productSnapshot')
-    .populate('approvedBy', 'displayName');
+    .populate('rejectedAfterCompletionBy', 'displayName');
 
   publishChange({
     topics: ['withdrawals', 'applications', 'loans', 'dashboard', 'reports', 'notifications'],
-    action: 'WITHDRAWAL_APPROVED',
+    action: 'WITHDRAWAL_REJECTED_AFTER_COMPLETION',
     entityId: savedWithdrawal._id,
     roles: [ROLES.ADMIN, ROLES.SUPER_ADMIN],
     userIds: [customerUserId]
