@@ -1,10 +1,12 @@
 import crypto from 'node:crypto';
+import mongoose from 'mongoose';
 import Customer from '../models/Customer.js';
 import Loan from '../models/Loan.js';
 import LoanApplication from '../models/LoanApplication.js';
 import LoanTransaction from '../models/LoanTransaction.js';
 import Notification from '../models/Notification.js';
 import Withdrawal from '../models/Withdrawal.js';
+import WithdrawalCode from '../models/WithdrawalCode.js';
 import { ROLES } from '../constants/index.js';
 import { writeAudit } from '../services/auditService.js';
 import { publishChange } from '../services/realtimeService.js';
@@ -19,32 +21,6 @@ import { runDatabaseWork, sessionOptions } from '../utils/databaseWork.js';
 import { toDecimal, toMoney } from '../utils/decimal.js';
 
 const WITHDRAW_CODE_LIFETIME_MS = 10 * 60 * 1000;
-const WITHDRAWAL_REJECTION_REASONS = [
-  'WITHDRAWAL WRONG AMOUNT',
-  'WRONG BANK ACCOUNT',
-  'LOW CREDIT',
-  'WRONG INFORMATION',
-  'INSURANCE',
-  'PLATEFORM FEE',
-  'VIP CHANNEL',
-  'NEW DOCUMENT AND NEW OTP CODE',
-  'FREEZE LOAN ACCOUNT',
-  'INLAND REVENUE TAX',
-  'NEED NEW OTP CODE'
-];
-const COMPLETED_WITHDRAWAL_REJECTION_REASONS = [
-  'WITHDRAWAL WRONG AMOUNT',
-  'WRONG BANK ACCOUNT',
-  'LOW CREDIT',
-  'WRONG INFORMATION',
-  'INSURANCE',
-  'PLATEFORM FEE',
-  'VIP CHANNEL',
-  'NEW DOCUMENT AND NEW OTP CODE',
-  'FREEZE LOAN ACCOUNT',
-  'INLAND REVENUE TAX',
-  'NEED NEW OTP CODE'
-];
 
 function requiredText(value, label, maximumLength = 120) {
   const text = String(value || '').trim();
@@ -119,11 +95,133 @@ async function notifyCustomer({ customer, title, message, referenceId, session }
   );
 }
 
+async function expireCustomerWithdrawalCodes(session = null) {
+  const options = session ? { session } : {};
+  await WithdrawalCode.updateMany(
+    {
+      status: 'ACTIVE',
+      expiresAt: { $lte: new Date() }
+    },
+    { $set: { status: 'EXPIRED' } },
+    options
+  );
+}
+
+export const listWithdrawalCodes = asyncHandler(async (req, res) => {
+  await expireCustomerWithdrawalCodes();
+  const limit = Math.min(Math.max(Number(req.query.limit) || 100, 1), 1000);
+
+  const items = await WithdrawalCode.find({})
+    .populate('customerId', 'customerCode name firstName middleName lastName phone')
+    .populate('createdBy', 'displayName')
+    .populate('withdrawalId', 'withdrawalNumber status amount')
+    .sort({ createdAt: -1 })
+    .limit(limit);
+
+  res.json({ success: true, items });
+});
+
+export const createWithdrawalCode = asyncHandler(async (req, res) => {
+  const customerId = requiredText(req.body.customerId, 'Customer');
+  const code = String(req.body.code || '')
+    .normalize('NFKC')
+    .replace(/\D/g, '');
+
+  if (!/^\d{6}$|^\d{8}$/.test(code)) {
+    throw new AppError('Withdraw code must contain exactly 6 or 8 digits', 422);
+  }
+
+  let savedCodeId;
+  let customerUserId = null;
+
+  try {
+    await runDatabaseWork(async (session) => {
+      await expireCustomerWithdrawalCodes(session);
+
+      const customer = await Customer.findById(customerId).session(session);
+      if (!customer) throw new AppError('Customer not found', 404);
+      if (customer.status !== 'ACTIVE') {
+        throw new AppError('Withdraw codes can be created only for active customers', 409);
+      }
+
+      customerUserId = customer.userId || null;
+
+      await WithdrawalCode.updateMany(
+        { customerId: customer._id, status: 'ACTIVE' },
+        { $set: { status: 'REVOKED' } },
+        session ? { session } : {}
+      );
+
+      const now = new Date();
+      const codeId = new mongoose.Types.ObjectId();
+      const [savedCode] = await WithdrawalCode.create(
+        [{
+          _id: codeId,
+          customerId: customer._id,
+          codeHash: hashWithdrawCode(codeId, code),
+          codeLength: code.length,
+          status: 'ACTIVE',
+          attempts: 0,
+          maxAttempts: 5,
+          expiresAt: new Date(now.getTime() + WITHDRAW_CODE_LIFETIME_MS),
+          createdBy: req.user._id
+        }],
+        sessionOptions(session)
+      );
+
+      await notifyCustomer({
+        customer,
+        title: 'Withdraw code ready',
+        message: `Your ${code.length}-digit withdraw code is ready. Enter it together with your withdrawal amount.`,
+        referenceId: savedCode._id,
+        session
+      });
+
+      await writeAudit({
+        req,
+        action: 'WITHDRAWAL_CODE_CREATED',
+        entityType: 'WITHDRAWAL_CODE',
+        entityId: savedCode._id,
+        newValues: {
+          customerId: customer._id,
+          codeLength: code.length,
+          expiresAt: savedCode.expiresAt
+        },
+        session
+      });
+
+      savedCodeId = savedCode._id;
+    });
+  } catch (error) {
+    if (error?.code === 11000) {
+      throw new AppError(
+        'Another active withdraw code already exists for this customer. Please try again.',
+        409
+      );
+    }
+    throw error;
+  }
+
+  const savedCode = await WithdrawalCode.findById(savedCodeId)
+    .populate('customerId', 'customerCode name firstName middleName lastName phone')
+    .populate('createdBy', 'displayName');
+
+  publishChange({
+    topics: ['withdrawals', 'withdrawal-codes', 'notifications'],
+    action: 'WITHDRAWAL_CODE_CREATED',
+    entityId: savedCode._id,
+    roles: [ROLES.ADMIN, ROLES.SUPER_ADMIN],
+    userIds: [customerUserId]
+  });
+
+  res.status(201).json({ success: true, item: savedCode });
+});
+
 export const listWithdrawals = asyncHandler(async (req, res) => {
   await expireWithdrawalCodes();
 
   const page = Math.max(Number(req.query.page) || 1, 1);
-  const limit = Math.min(Math.max(Number(req.query.limit) || 100, 1), 100);
+  const limit = Math.min(Math.max(Number(req.query.limit) || 100, 1), 1000);
   const filter = {};
 
   if (req.role === ROLES.CUSTOMER) {
@@ -161,6 +259,293 @@ export const listWithdrawals = asyncHandler(async (req, res) => {
       total,
       pages: Math.ceil(total / limit)
     }
+  });
+});
+
+export const completeWithdrawal = asyncHandler(async (req, res) => {
+  const amount = positiveAmount(req.body.amount);
+  const loanId = requiredText(req.body.loanId, 'Loan');
+  const code = String(req.body.code || '')
+    .normalize('NFKC')
+    .replace(/\D/g, '');
+
+  if (!/^\d{6}$|^\d{8}$/.test(code)) {
+    throw new AppError('Withdraw code must contain exactly 6 or 8 digits', 422);
+  }
+
+  let savedWithdrawalId;
+  let customerUserId = null;
+  let failure = null;
+  let action = 'WITHDRAWAL_COMPLETED';
+
+  await runDatabaseWork(async (session) => {
+    await expireCustomerWithdrawalCodes(session);
+
+    const customer = await customerForUser(req.user._id, session);
+    customerUserId = customer.userId;
+
+    const withdrawalCode = await WithdrawalCode.findOne({
+      customerId: customer._id,
+      status: 'ACTIVE'
+    })
+      .select('+codeHash')
+      .sort({ createdAt: -1 })
+      .session(session);
+
+    if (!withdrawalCode) {
+      throw new AppError(
+        'No active withdraw code was found. Ask the administrator to create one.',
+        409
+      );
+    }
+
+    if (withdrawalCode.expiresAt <= new Date()) {
+      withdrawalCode.status = 'EXPIRED';
+      await withdrawalCode.save(sessionOptions(session));
+      failure = {
+        message: 'The withdraw code expired. Ask the administrator for a new code.',
+        status: 410
+      };
+      action = 'WITHDRAWAL_CODE_EXPIRED';
+      return;
+    }
+
+    const codeIsValid = code.length === withdrawalCode.codeLength &&
+      withdrawCodeMatches(
+        withdrawalCode.codeHash,
+        hashWithdrawCode(withdrawalCode._id, code)
+      );
+
+    if (!codeIsValid) {
+      withdrawalCode.attempts += 1;
+      const attemptsRemaining = Math.max(
+        withdrawalCode.maxAttempts - withdrawalCode.attempts,
+        0
+      );
+
+      if (!attemptsRemaining) {
+        withdrawalCode.status = 'REVOKED';
+        failure = {
+          message: 'The withdraw code was revoked after too many incorrect attempts.',
+          status: 429
+        };
+        action = 'WITHDRAWAL_CODE_REVOKED';
+      } else {
+        failure = {
+          message: `Incorrect withdraw code. ${attemptsRemaining} attempts remaining.`,
+          status: 422
+        };
+        action = 'WITHDRAWAL_CODE_REJECTED';
+      }
+
+      await withdrawalCode.save(sessionOptions(session));
+      return;
+    }
+
+    const loan = await Loan.findOne({
+      _id: loanId,
+      customerId: customer._id
+    }).session(session);
+    if (!loan) throw new AppError('Loan not found', 404);
+    if (!['APPROVED', 'ACTIVE'].includes(loan.status)) {
+      throw new AppError('Only an approved or active loan can be withdrawn', 409);
+    }
+
+    const application = await LoanApplication.findById(loan.applicationId)
+      .select('applicantSnapshot')
+      .session(session);
+    if (!application) {
+      throw new AppError('The related loan application was not found', 409);
+    }
+
+    const bankName = String(
+      application.applicantSnapshot?.bankName || customer.bankName || ''
+    ).trim();
+    const bankAccountNumber = String(
+      application.applicantSnapshot?.bankAccountNumber || customer.bankNumber || ''
+    ).trim();
+    if (!bankName || !bankAccountNumber) {
+      throw new AppError(
+        'No bank information is saved with this loan application',
+        409
+      );
+    }
+
+    const wallet = await walletSummaryForLoan(loan, session);
+    if (amount.gt(toDecimal(wallet.availableBalance))) {
+      throw new AppError('Withdrawal amount exceeds the available wallet balance', 422);
+    }
+
+    const now = new Date();
+    const claimedCode = await WithdrawalCode.findOneAndUpdate(
+      { _id: withdrawalCode._id, status: 'ACTIVE' },
+      { $set: { status: 'USED', usedAt: now } },
+      { new: true, ...sessionOptions(session) }
+    );
+    if (!claimedCode) {
+      throw new AppError(
+        'This withdraw code was already used or replaced. Ask the administrator for a new code.',
+        409
+      );
+    }
+
+    const automaticallyDisbursed = loan.status === 'APPROVED';
+
+    if (automaticallyDisbursed) {
+      loan.status = 'ACTIVE';
+      loan.disbursedAt = now;
+      await loan.save(sessionOptions(session));
+
+      await LoanApplication.findByIdAndUpdate(
+        loan.applicationId,
+        { status: 'DISBURSED' },
+        sessionOptions(session)
+      );
+
+      await LoanTransaction.create(
+        [{
+          transactionNumber: await nextNumber('transaction', 'TRX', session),
+          loanId: loan._id,
+          transactionType: 'DISBURSEMENT',
+          amount: loan.principalAmount,
+          breakdown: { principal: loan.principalAmount },
+          referenceType: 'LOAN',
+          referenceId: loan._id,
+          description: 'Loan automatically disbursed after direct withdrawal',
+          transactionDate: now,
+          createdBy: req.user._id
+        }],
+        sessionOptions(session)
+      );
+    }
+
+    let withdrawal = await Withdrawal.findOne({
+      loanId: loan._id,
+      customerId: customer._id,
+      isOpen: true
+    })
+      .select('+withdrawCodeHash +otpHash')
+      .session(session);
+
+    if (!withdrawal) {
+      [withdrawal] = await Withdrawal.create(
+        [{
+          withdrawalNumber: await nextNumber('withdrawal', 'WDR', session),
+          customerId: customer._id,
+          loanId: loan._id,
+          amount: toMoney(amount),
+          requestedBank: { bankName, bankAccountNumber },
+          customerBankSnapshot: { bankName, bankAccountNumber },
+          bankMatch: { bankName: true, bankAccountNumber: true },
+          status: 'COMPLETED',
+          isOpen: false,
+          withdrawCodeLength: claimedCode.codeLength,
+          withdrawCodeSetBy: claimedCode.createdBy,
+          withdrawCodeSetAt: claimedCode.createdAt,
+          withdrawCodeVerifiedAt: now,
+          completedAt: now,
+          createdBy: req.user._id
+        }],
+        sessionOptions(session)
+      );
+    } else {
+      withdrawal.amount = toMoney(amount);
+      withdrawal.requestedBank = { bankName, bankAccountNumber };
+      withdrawal.customerBankSnapshot = { bankName, bankAccountNumber };
+      withdrawal.bankMatch = { bankName: true, bankAccountNumber: true };
+      withdrawal.status = 'COMPLETED';
+      withdrawal.isOpen = false;
+      withdrawal.withdrawCodeLength = claimedCode.codeLength;
+      withdrawal.withdrawCodeSetBy = claimedCode.createdBy;
+      withdrawal.withdrawCodeSetAt = claimedCode.createdAt;
+      withdrawal.withdrawCodeVerifiedAt = now;
+      withdrawal.completedAt = now;
+      withdrawal.withdrawCodeHash = undefined;
+      withdrawal.withdrawCodeExpiresAt = null;
+      withdrawal.otpHash = undefined;
+      withdrawal.otpExpiresAt = null;
+      await withdrawal.save(sessionOptions(session));
+    }
+
+    await LoanTransaction.create(
+      [{
+        transactionNumber: await nextNumber('transaction', 'TRX', session),
+        loanId: loan._id,
+        transactionType: 'WITHDRAWAL',
+        amount: withdrawal.amount,
+        referenceType: 'WITHDRAWAL',
+        referenceId: withdrawal._id,
+        description: `Wallet withdrawal ${withdrawal.withdrawalNumber}`,
+        transactionDate: now,
+        createdBy: req.user._id
+      }],
+      sessionOptions(session)
+    );
+
+    await WithdrawalCode.updateOne(
+      { _id: claimedCode._id, status: 'USED' },
+      { $set: { withdrawalId: withdrawal._id } },
+      session ? { session } : {}
+    );
+
+    await notifyCustomer({
+      customer,
+      title: 'Withdrawal successful',
+      message: `${withdrawal.withdrawalNumber} was completed successfully.`,
+      referenceId: withdrawal._id,
+      session
+    });
+
+    await writeAudit({
+      req,
+      action: 'WITHDRAWAL_COMPLETED',
+      entityType: 'WITHDRAWAL',
+      entityId: withdrawal._id,
+      newValues: {
+        loanId: loan._id,
+        amount: withdrawal.amount,
+        withdrawalCodeId: claimedCode._id,
+        completedAt: now,
+        loanAutomaticallyDisbursed: automaticallyDisbursed
+      },
+      session
+    });
+
+    savedWithdrawalId = withdrawal._id;
+  });
+
+  if (failure) {
+    publishChange({
+      topics: ['withdrawal-codes'],
+      action,
+      roles: [ROLES.ADMIN, ROLES.SUPER_ADMIN],
+      userIds: [customerUserId]
+    });
+    throw new AppError(failure.message, failure.status);
+  }
+
+  const savedWithdrawal = await Withdrawal.findById(savedWithdrawalId)
+    .populate('loanId', 'loanNumber status productSnapshot');
+
+  publishChange({
+    topics: [
+      'withdrawals',
+      'withdrawal-codes',
+      'applications',
+      'loans',
+      'dashboard',
+      'reports',
+      'notifications'
+    ],
+    action: 'WITHDRAWAL_COMPLETED',
+    entityId: savedWithdrawal._id,
+    roles: [ROLES.ADMIN, ROLES.SUPER_ADMIN],
+    userIds: [customerUserId]
+  });
+
+  res.status(201).json({
+    success: true,
+    item: customerResponse(savedWithdrawal)
   });
 });
 
@@ -371,9 +756,6 @@ export const setWithdrawalCode = asyncHandler(async (req, res) => {
 
 export const rejectWithdrawal = asyncHandler(async (req, res) => {
   const reason = requiredText(req.body.reason, 'Rejection reason', 500);
-  if (!WITHDRAWAL_REJECTION_REASONS.includes(reason)) {
-    throw new AppError('Select a valid withdrawal rejection reason', 422);
-  }
   let savedWithdrawalId;
   let customerUserId = null;
 
@@ -659,9 +1041,6 @@ export const verifyWithdrawalCode = asyncHandler(async (req, res) => {
 
 export const rejectCompletedWithdrawal = asyncHandler(async (req, res) => {
   const reason = requiredText(req.body.reason, 'Rejection reason', 500);
-  if (!COMPLETED_WITHDRAWAL_REJECTION_REASONS.includes(reason)) {
-    throw new AppError('Select a valid withdrawal rejection reason', 422);
-  }
   let savedWithdrawalId;
   let customerUserId = null;
 
@@ -735,4 +1114,84 @@ export const rejectCompletedWithdrawal = asyncHandler(async (req, res) => {
   });
 
   res.json({ success: true, item: savedWithdrawal });
+});
+
+export const forceDeleteWithdrawal = asyncHandler(async (req, res) => {
+  let deletedWithdrawal;
+  let customerUserId = null;
+  let deletedTransactions = 0;
+
+  await runDatabaseWork(async (session) => {
+    const withdrawal = await Withdrawal.findById(req.params.id).session(session);
+    if (!withdrawal) throw new AppError('Withdrawal request not found', 404);
+
+    const customer = await Customer.findById(withdrawal.customerId).session(session);
+    customerUserId = customer?.userId || null;
+    deletedWithdrawal = withdrawal.toObject();
+
+    await writeAudit({
+      req,
+      action: 'WITHDRAWAL_FORCE_DELETED',
+      entityType: 'WITHDRAWAL',
+      entityId: withdrawal._id,
+      oldValues: {
+        withdrawalNumber: withdrawal.withdrawalNumber,
+        customerId: withdrawal.customerId,
+        loanId: withdrawal.loanId,
+        amount: withdrawal.amount,
+        status: withdrawal.status
+      },
+      session
+    });
+
+    const transactionResult = await LoanTransaction.deleteMany(
+      {
+        referenceType: 'WITHDRAWAL',
+        referenceId: withdrawal._id,
+        transactionType: { $in: ['WITHDRAWAL', 'REVERSAL'] }
+      },
+      session ? { session } : {}
+    );
+    deletedTransactions = transactionResult.deletedCount || 0;
+
+    await WithdrawalCode.updateMany(
+      { withdrawalId: withdrawal._id },
+      { $set: { withdrawalId: null } },
+      session ? { session } : {}
+    );
+
+    await Withdrawal.deleteOne(
+      { _id: withdrawal._id },
+      session ? { session } : {}
+    );
+
+    await notifyCustomer({
+      customer,
+      title: 'Withdrawal record removed',
+      message: `${withdrawal.withdrawalNumber} was removed by an administrator.`,
+      referenceId: withdrawal._id,
+      session
+    });
+  });
+
+  publishChange({
+    topics: [
+      'withdrawals',
+      'withdrawal-codes',
+      'loans',
+      'dashboard',
+      'reports',
+      'notifications'
+    ],
+    action: 'WITHDRAWAL_FORCE_DELETED',
+    entityId: deletedWithdrawal._id,
+    roles: [ROLES.ADMIN, ROLES.SUPER_ADMIN],
+    userIds: [customerUserId]
+  });
+
+  res.json({
+    success: true,
+    message: 'Withdrawal and related transactions were permanently deleted',
+    deletedTransactions
+  });
 });

@@ -1,12 +1,13 @@
 import { Router } from 'express';
 import rateLimit from 'express-rate-limit';
 import {
-  createWithdrawal,
+  completeWithdrawal,
+  createWithdrawalCode,
+  forceDeleteWithdrawal,
+  listWithdrawalCodes,
   listWithdrawals,
   rejectCompletedWithdrawal,
-  rejectWithdrawal,
-  setWithdrawalCode,
-  verifyWithdrawalCode
+  rejectWithdrawal
 } from '../controllers/withdrawalController.js';
 import { ROLES } from '../constants/index.js';
 import { allowRoles, authenticate } from '../middleware/auth.js';
@@ -19,16 +20,21 @@ router.get(
   allowRoles(ROLES.CUSTOMER, ROLES.ADMIN, ROLES.SUPER_ADMIN),
   listWithdrawals
 );
-router.post(
-  '/',
-  rateLimit({ windowMs: 60 * 60 * 1000, limit: 10 }),
-  allowRoles(ROLES.CUSTOMER),
-  createWithdrawal
+router.get(
+  '/codes',
+  allowRoles(ROLES.ADMIN, ROLES.SUPER_ADMIN),
+  listWithdrawalCodes
 );
 router.post(
-  '/:id/set-code',
+  '/codes',
   allowRoles(ROLES.ADMIN, ROLES.SUPER_ADMIN),
-  setWithdrawalCode
+  createWithdrawalCode
+);
+router.post(
+  '/complete',
+  rateLimit({ windowMs: 60 * 60 * 1000, limit: 10 }),
+  allowRoles(ROLES.CUSTOMER),
+  completeWithdrawal
 );
 router.post(
   '/:id/reject',
@@ -36,15 +42,14 @@ router.post(
   rejectWithdrawal
 );
 router.post(
-  '/:id/verify-code',
-  rateLimit({ windowMs: 15 * 60 * 1000, limit: 20 }),
-  allowRoles(ROLES.CUSTOMER),
-  verifyWithdrawalCode
-);
-router.post(
   '/:id/reject-completed',
   allowRoles(ROLES.ADMIN, ROLES.SUPER_ADMIN),
   rejectCompletedWithdrawal
+);
+router.delete(
+  '/:id/force',
+  allowRoles(ROLES.ADMIN, ROLES.SUPER_ADMIN),
+  forceDeleteWithdrawal
 );
 
 export default router;

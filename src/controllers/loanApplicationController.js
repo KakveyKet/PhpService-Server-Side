@@ -16,23 +16,6 @@ import { runDatabaseWork, sessionOptions } from '../utils/databaseWork.js';
 import { toDecimal, toMoney } from '../utils/decimal.js';
 
 const CUSTOMER_TERM_OPTIONS = [6, 12, 24, 36, 48];
-const FIRST_APPLICATION_CREDIT_SCORE = 250;
-
-async function grantFirstApplicationCredit(customerId) {
-  const updatedCustomer = await Customer.findOneAndUpdate(
-    {
-      _id: customerId,
-      firstApplicationCreditGranted: { $ne: true }
-    },
-    {
-      $max: { creditScore: FIRST_APPLICATION_CREDIT_SCORE },
-      $set: { firstApplicationCreditGranted: true }
-    },
-    { new: true }
-  );
-
-  return Boolean(updatedCustomer);
-}
 
 function uploadPrivateImage(buffer, options) {
   const cloudinary = getCloudinary();
@@ -119,7 +102,7 @@ function dateRangeFromQuery(query) {
 
 export const listApplications = asyncHandler(async (req, res) => {
   const page = Math.max(Number(req.query.page) || 1, 1);
-  const limit = Math.min(Math.max(Number(req.query.limit) || 20, 1), 100);
+  const limit = Math.min(Math.max(Number(req.query.limit) || 20, 1), 1000);
   const filter = {};
 
   if (req.role === ROLES.CUSTOMER) filter.customerId = (await customerForUser(req.user._id))._id;
@@ -131,7 +114,11 @@ export const listApplications = asyncHandler(async (req, res) => {
 
   const [items, total] = await Promise.all([
     LoanApplication.find(filter)
-      .populate('customerId', 'customerCode name firstName middleName lastName phone')
+      .populate({
+        path: 'customerId',
+        select: 'customerCode name firstName middleName lastName phone userId',
+        populate: { path: 'userId', select: 'username' }
+      })
       .populate({ path: 'productId', populate: { path: 'rateId' } })
       .sort({ createdAt: -1 })
       .skip((page - 1) * limit)
@@ -302,8 +289,6 @@ export const createApplication = asyncHandler(async (req, res) => {
       createdBy: req.user._id
     });
 
-    const initialCreditGranted = await grantFirstApplicationCredit(customer._id);
-
     await writeAudit({
       req,
       action: 'LOAN_APPLICATION_CREATED',
@@ -315,16 +300,12 @@ export const createApplication = asyncHandler(async (req, res) => {
         requestedTerm: term,
         termsAcceptedAt,
         identityImagesSubmitted: true,
-        signatureSubmitted: true,
-        initialCreditGranted,
-        creditScore: initialCreditGranted
-          ? FIRST_APPLICATION_CREDIT_SCORE
-          : undefined
+        signatureSubmitted: true
       }
     });
 
     publishChange({
-      topics: ['applications', 'dashboard', 'customers', 'profile'],
+      topics: ['applications', 'dashboard', 'customers'],
       action: 'LOAN_APPLICATION_CREATED',
       entityId: application._id,
       staff: true,
@@ -349,24 +330,10 @@ export const createApplication = asyncHandler(async (req, res) => {
     createdBy: req.user._id
   });
 
-  const initialCreditGranted = await grantFirstApplicationCredit(customer._id);
-
-  await writeAudit({
-    req,
-    action: 'LOAN_APPLICATION_CREATED',
-    entityType: 'LOAN_APPLICATION',
-    entityId: application._id,
-    newValues: {
-      ...req.body,
-      initialCreditGranted,
-      creditScore: initialCreditGranted
-        ? FIRST_APPLICATION_CREDIT_SCORE
-        : undefined
-    }
-  });
+  await writeAudit({ req, action: 'LOAN_APPLICATION_CREATED', entityType: 'LOAN_APPLICATION', entityId: application._id, newValues: req.body });
 
   publishChange({
-    topics: ['applications', 'dashboard', 'customers', 'profile'],
+    topics: ['applications', 'dashboard'],
     action: 'LOAN_APPLICATION_CREATED',
     entityId: application._id,
     staff: true,

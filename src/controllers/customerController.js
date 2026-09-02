@@ -90,7 +90,7 @@ function maskExceptLastThree(value) {
 
 export const listCustomers = asyncHandler(async (req, res) => {
   const page = Math.max(Number(req.query.page) || 1, 1);
-  const limit = Math.min(Math.max(Number(req.query.limit) || 20, 1), 100);
+  const limit = Math.min(Math.max(Number(req.query.limit) || 20, 1), 1000);
   const filter = {};
 
   if (req.query.status) filter.status = req.query.status;
@@ -254,23 +254,6 @@ export const updateCustomer = asyncHandler(async (req, res) => {
 
     if (req.body.monthlyIncome !== undefined) {
       customer.monthlyIncome = toMoney(req.body.monthlyIncome);
-    }
-
-    if (req.body.creditScore !== undefined) {
-      const creditScore = Number(req.body.creditScore);
-
-      if (
-        !Number.isSafeInteger(creditScore) ||
-        creditScore < 0 ||
-        creditScore > 10000
-      ) {
-        throw new AppError(
-          'Credit score must be a whole number between 0 and 10000',
-          422
-        );
-      }
-
-      customer.creditScore = creditScore;
     }
 
     if (req.body.phone !== undefined) {

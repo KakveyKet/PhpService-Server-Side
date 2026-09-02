@@ -51,7 +51,7 @@ function dateRangeFromQuery(query) {
 
 export const listLoans = asyncHandler(async (req, res) => {
   const page = Math.max(Number(req.query.page) || 1, 1);
-  const limit = Math.min(Math.max(Number(req.query.limit) || 20, 1), 100);
+  const limit = Math.min(Math.max(Number(req.query.limit) || 20, 1), 1000);
   const filter = {};
   const ownCustomerId = await customerIdForRequest(req);
   if (ownCustomerId) filter.customerId = ownCustomerId;
@@ -63,7 +63,11 @@ export const listLoans = asyncHandler(async (req, res) => {
 
   const [items, total] = await Promise.all([
     Loan.find(filter)
-      .populate('customerId', 'customerCode name firstName middleName lastName phone')
+      .populate({
+        path: 'customerId',
+        select: 'customerCode name firstName middleName lastName phone userId',
+        populate: { path: 'userId', select: 'username' }
+      })
       .populate('productId', 'productCode name')
       .sort({ createdAt: -1 })
       .skip((page - 1) * limit)

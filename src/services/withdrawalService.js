@@ -78,8 +78,8 @@ export async function withdrawalTotalsForLoan(loanId, session = null) {
 export function walletSummaryFromTotals(principalAmount, totals) {
   const principal = toDecimal(principalAmount);
 
-  // A request does not change the customer's visible balance. Money leaves
-  // the wallet only after an Admin or Super Admin approves the withdrawal.
+  // Legacy pending requests do not change the visible balance. Money leaves
+  // the wallet only when a withdraw code completes the withdrawal.
   const available = principal.minus(totals.withdrawn);
 
   return {
