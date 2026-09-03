@@ -116,7 +116,7 @@ export const listApplications = asyncHandler(async (req, res) => {
     LoanApplication.find(filter)
       .populate({
         path: 'customerId',
-        select: 'customerCode name firstName middleName lastName phone userId',
+        select: 'customerCode name firstName middleName lastName phone occupation monthlyIncome userId',
         populate: { path: 'userId', select: 'username' }
       })
       .populate({ path: 'productId', populate: { path: 'rateId' } })
@@ -431,7 +431,10 @@ export const updateApplicationPlan = asyncHandler(async (req, res) => {
   });
 
   const savedApplication = await LoanApplication.findById(savedApplicationId)
-    .populate('customerId', 'customerCode name firstName middleName lastName phone')
+    .populate(
+      'customerId',
+      'customerCode name firstName middleName lastName phone occupation monthlyIncome'
+    )
     .populate({ path: 'productId', populate: { path: 'rateId' } });
 
   publishChange({

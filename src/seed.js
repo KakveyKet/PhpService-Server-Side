@@ -64,18 +64,20 @@ async function seed() {
     });
   }
 
-  let rate = await Rate.findOne({ rateCode: 'RATE-0001' });
-  if (!rate) {
-    rate = await Rate.create({
-      rateCode: 'RATE-0001',
-      name: 'Monthly 0.7% Flat',
-      ratePercent: toRate('0.7'),
-      period: 'MONTHLY',
-      calculationMethod: 'FLAT',
-      status: 'ACTIVE',
-      createdBy: superAdmin._id
-    });
-  }
+  const rate = await Rate.findOneAndUpdate(
+    { rateCode: 'RATE-0001' },
+    {
+      $set: {
+        name: 'Monthly 0.3% Flat',
+        ratePercent: toRate('0.3'),
+        period: 'MONTHLY',
+        calculationMethod: 'FLAT',
+        status: 'ACTIVE'
+      },
+      $setOnInsert: { createdBy: superAdmin._id }
+    },
+    { upsert: true, returnDocument: 'after' }
+  );
 
   const starterProducts = [
     {
@@ -115,7 +117,7 @@ async function seed() {
           maximumTerm: 48,
           termUnit: 'MONTH',
           repaymentFrequency: 'MONTHLY',
-          processingFeePercent: toRate(1),
+          processingFeePercent: toRate(0),
           lateFeeType: 'FIXED',
           lateFeeValue: toRate(100),
           gracePeriodDays: 3,
