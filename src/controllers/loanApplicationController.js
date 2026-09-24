@@ -151,6 +151,38 @@ export const createApplication = asyncHandler(async (req, res) => {
 
   const term = Number(requestedTerm);
   const isCustomerPortalApplication = req.role === ROLES.CUSTOMER;
+  const submissionKey = isCustomerPortalApplication
+    ? requiredText(req.body.submissionKey, 'Submission key')
+    : '';
+
+  if (isCustomerPortalApplication) {
+    const previousSubmission = await LoanApplication.findOne({ submissionKey });
+
+    if (previousSubmission) {
+      if (String(previousSubmission.customerId) !== String(customer._id)) {
+        throw new AppError('This submission key has already been used', 409);
+      }
+
+      res.status(200).json({
+        success: true,
+        item: previousSubmission,
+        duplicate: true
+      });
+      return;
+    }
+
+    const openApplication = await LoanApplication.findOne({
+      customerId: customer._id,
+      status: { $in: ['SUBMITTED', 'UNDER_REVIEW'] }
+    }).sort({ createdAt: -1 });
+
+    if (openApplication) {
+      throw new AppError(
+        `Application ${openApplication.applicationNumber} is already under review`,
+        409
+      );
+    }
+  }
 
   if (
     isCustomerPortalApplication &&
@@ -184,6 +216,13 @@ export const createApplication = asyncHandler(async (req, res) => {
       req.body.bankAccountNumber,
       'Bank account number'
     );
+    const occupation = requiredText(req.body.occupation, 'Occupation');
+    const submittedMonthlyIncome = toDecimal(req.body.monthlyIncome);
+
+    if (submittedMonthlyIncome.lessThanOrEqualTo(0)) {
+      throw new AppError('Monthly income must be greater than zero', 422);
+    }
+
     const signatureFile = req.files?.signature?.[0];
 
     if (!signatureFile) {
@@ -256,6 +295,8 @@ export const createApplication = asyncHandler(async (req, res) => {
     customer.nationalId = idCardNumber;
     customer.bankName = bankName;
     customer.bankNumber = bankAccountNumber;
+    customer.occupation = occupation;
+    customer.monthlyIncome = toMoney(submittedMonthlyIncome);
     customer.identityVerificationStatus = 'PENDING';
     customer.identityVerifiedBy = null;
     customer.identityVerifiedAt = null;
@@ -266,28 +307,54 @@ export const createApplication = asyncHandler(async (req, res) => {
       address: applicantAddress,
       idCardNumber,
       bankName,
-      bankAccountNumber
+      bankAccountNumber,
+      occupation
     };
     termsAcceptedAt = new Date();
     termsVersion = 'LOAN_SERVICE_TERMS_V1';
 
-    const application = await LoanApplication.create({
-      applicationNumber,
-      customerId: customer._id,
-      productId: product._id,
-      requestedAmount: toMoney(amount),
-      requestedTerm: term,
-      purpose,
-      applicantSnapshot,
-      termsAcceptedAt,
-      termsVersion,
-      signature,
-      monthlyIncome: toMoney(req.body.monthlyIncome ?? customer.monthlyIncome ?? 0),
-      monthlyExpense: toMoney(req.body.monthlyExpense || 0),
-      collateralDescription: req.body.collateralDescription || '',
-      status: 'SUBMITTED',
-      createdBy: req.user._id
-    });
+    let application;
+
+    try {
+      application = await LoanApplication.create({
+        applicationNumber,
+        submissionKey,
+        customerId: customer._id,
+        productId: product._id,
+        requestedAmount: toMoney(amount),
+        requestedTerm: term,
+        purpose,
+        applicantSnapshot,
+        termsAcceptedAt,
+        termsVersion,
+        signature,
+        monthlyIncome: toMoney(submittedMonthlyIncome),
+        monthlyExpense: toMoney(req.body.monthlyExpense || 0),
+        collateralDescription: req.body.collateralDescription || '',
+        status: 'SUBMITTED',
+        createdBy: req.user._id
+      });
+    } catch (error) {
+      const isDuplicateSubmission =
+        error?.code === 11000 &&
+        (error?.keyPattern?.submissionKey || error?.keyValue?.submissionKey);
+
+      if (!isDuplicateSubmission) throw error;
+
+      const previousSubmission = await LoanApplication.findOne({
+        submissionKey,
+        customerId: customer._id
+      });
+
+      if (!previousSubmission) throw error;
+
+      res.status(200).json({
+        success: true,
+        item: previousSubmission,
+        duplicate: true
+      });
+      return;
+    }
 
     await writeAudit({
       req,
@@ -548,7 +615,7 @@ export const reviewApplication = asyncHandler(async (req, res) => {
         ratePeriod: product.rateId.period,
         calculationMethod: product.rateId.calculationMethod,
         repaymentFrequency: product.repaymentFrequency,
-        processingFeePercent: product.processingFeePercent,
+        processingFeePercent: 0,
         startDate
       });
 

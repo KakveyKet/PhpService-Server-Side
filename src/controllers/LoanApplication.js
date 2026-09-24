@@ -45,7 +45,6 @@ const applicantSnapshotSchema = new mongoose.Schema(
 const loanApplicationSchema = new mongoose.Schema(
   {
     applicationNumber: { type: String, required: true, unique: true },
-    submissionKey: { type: String, trim: true },
     customerId: { type: mongoose.Schema.Types.ObjectId, ref: 'Customer', required: true, index: true },
     productId: { type: mongoose.Schema.Types.ObjectId, ref: 'Product', required: true },
     requestedAmount: { type: mongoose.Schema.Types.Decimal128, required: true },
@@ -82,12 +81,5 @@ const loanApplicationSchema = new mongoose.Schema(
 );
 
 loanApplicationSchema.index({ customerId: 1, status: 1, createdAt: -1 });
-loanApplicationSchema.index(
-  { submissionKey: 1 },
-  {
-    unique: true,
-    partialFilterExpression: { submissionKey: { $type: 'string' } }
-  }
-);
 
 export default mongoose.model('LoanApplication', loanApplicationSchema);
